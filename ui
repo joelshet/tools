@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["playwright"]
+# ///
+"""Operate a website as a persistent session; every action returns the diff it caused.
+
+A daemon holds one headless (or headed) browser per named session; commands talk
+to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
+(id kind label cx cy w h state); actions answer with the change they caused, so
+"= N unchanged" alone means the action did nothing visible. Only elements in the
+viewport are clickable; scroll to reveal more. One-time setup beyond deps:
+playwright install chromium.
+"""
+import argparse
+import json
+import os
+import pathlib
+import socket
+import subprocess
+import sys
+import time
+
+STATE = pathlib.Path.home() / ".tools" / "ui"
+W, H = 375, 812
+SCREENSHOT_TOKENS = 1624  # 750x1624 @2x via the ~(w*h)/750 vision formula
+TOL = 3  # px of coordinate jitter that still counts as unchanged
+
+EXTRACT = r"""(() => {
+  const seen = new Set();
+  const lines = ['ts\tsource\tid\tkind\tlabel\tcx\tcy\tw\th\tstate'];
+  const ts = Math.floor(Date.now() / 1000);
+  let n = 0;
+  const sx = window.scrollX, sy = window.scrollY;
+  for (const el of document.querySelectorAll('a, button, input, select, textarea, [role="button"], h1, h2, h3, img, [onclick]')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) continue;
+    if (!el.getClientRects().length) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
+    let hidden = false;
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      const ps = getComputedStyle(p);
+      if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') { hidden = true; break; }
+    }
+    if (hidden) continue;
+    const tag = el.tagName.toLowerCase();
+    let kind = tag, state = '-';
+    let text = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (tag === 'a') kind = 'link';
+    if (tag === 'button' || el.getAttribute('role') === 'button') kind = 'button';
+    if (/^h[1-3]$/.test(tag)) kind = 'heading';
+    if (tag === 'img') { kind = 'img'; text = (el.alt || '').slice(0, 40); if (!text) continue; }
+    if (tag === 'input') {
+      kind = el.type || 'input';
+      text = (el.value || el.name || el.placeholder || '').slice(0, 40);
+      if (el.type === 'checkbox' || el.type === 'radio') state = el.checked ? 'on' : 'off';
+    }
+    const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
+    const key = kind + '|' + cx + '|' + cy + '|' + text;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    text = (text || '-').replace(/\t/g, ' ');
+    lines.push([ts, 'web', 'e' + (++n), kind, text, cx, cy, Math.round(r.width), Math.round(r.height), state].join('\t'));
+  }
+  return lines.join('\n');
+})()"""
+
+RIPPLE = """
+addEventListener('mousedown', e => {
+  const d = document.createElement('div');
+  d.style.cssText = `position:fixed;left:${e.clientX-14}px;top:${e.clientY-14}px;width:28px;height:28px;
+    border:3px solid #e33;border-radius:50%;pointer-events:none;z-index:2147483647;transition:all .45s;opacity:1`;
+  document.documentElement.appendChild(d);
+  requestAnimationFrame(() => { d.style.transform = 'scale(2.2)'; d.style.opacity = '0'; });
+  setTimeout(() => d.remove(), 600);
+}, true);
+"""
+
+
+# ---------- TSV diff ----------
+
+def parse(text):
+    rows = []
+    for line in text.rstrip("\n").split("\n")[1:]:
+        f = line.split("\t")
+        rows.append({"id": f[2], "kind": f[3], "label": f[4], "cx": int(f[5]), "cy": int(f[6]),
+                     "w": f[7], "h": f[8], "state": f[9]})
+    return rows
+
+
+def fmt(r, coords=True):
+    s = f"{r['id']} {r['kind']} \"{r['label']}\""
+    if coords:
+        s += f" @{r['cx']},{r['cy']} {r['w']}x{r['h']}"
+    if r["state"] != "-":
+        s += f" [{r['state']}]"
+    return s
+
+
+def diff(old, new):
+    import collections
+    pool = collections.defaultdict(list)
+    for r in old:
+        pool[(r["kind"], r["label"])].append(r)
+    unchanged, moved, added = 0, [], []
+    for r in new:
+        cands = pool.get((r["kind"], r["label"]))
+        if cands:
+            c = min(cands, key=lambda o: (o["cx"] - r["cx"]) ** 2 + (o["cy"] - r["cy"]) ** 2)
+            cands.remove(c)
+            dx, dy = r["cx"] - c["cx"], r["cy"] - c["cy"]
+            if abs(dx) <= TOL and abs(dy) <= TOL:
+                unchanged += 1
+            else:
+                moved.append((r, dx, dy))
+        else:
+            added.append(r)
+    removed = [r for rs in pool.values() for r in rs]
+
+    out = [f"= {unchanged} unchanged"]
+    shifts = collections.defaultdict(list)
+    for r, dx, dy in moved:
+        shifts[(dx, dy)].append(r)
+    for (dx, dy), rs in sorted(shifts.items(), key=lambda kv: -len(kv[1])):
+        if len(rs) >= 3:
+            out.append(f"~ {len(rs)} rows shifted ({dx:+},{dy:+})")
+        else:
+            for r in rs:
+                out.append(f"~ {r['id']} {r['kind']} \"{r['label']}\" ->{r['cx']},{r['cy']} ({dx:+},{dy:+})")
+    for r in added:
+        out.append("+ " + fmt(r))
+    if len(removed) > 10 and len(removed) * 3 > len(old):  # mass removal: page replaced
+        out.append(f"- {len(removed)} rows removed")
+    else:
+        for r in removed:
+            out.append("- " + fmt(r, coords=False) + f" @{r['cx']},{r['cy']}")
+    return "\n".join(out)
+
+
+# ---------- daemon ----------
+
+def run_daemon(url, sock, headed=False, video=False):
+    from playwright.sync_api import sync_playwright
+
+    if os.path.exists(sock):
+        os.unlink(sock)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(sock)
+    srv.listen(1)
+    ledger = []
+    with sync_playwright() as pl:
+        browser = pl.chromium.launch(headless=not headed)
+        ctx_opts = {"viewport": {"width": W, "height": H}}
+        if video:
+            (STATE / "video").mkdir(parents=True, exist_ok=True)
+            ctx_opts.update(record_video_dir=str(STATE / "video"), record_video_size={"width": W, "height": H})
+        ctx = browser.new_context(**ctx_opts)
+        if headed or video:
+            ctx.add_init_script(RIPPLE)
+        page = ctx.new_page()
+        page.goto(url, wait_until="load")
+        page.wait_for_timeout(1500)
+
+        state = {"last": snapshot(page)}
+        print("ready", flush=True)
+        while True:
+            conn, _ = srv.accept()
+            f = conn.makefile("rwb")
+            req = json.loads(f.readline())
+            t0 = time.time()
+            try:
+                out = handle(page, state, req)
+            except Exception as e:
+                out = {"error": f"{type(e).__name__}: {e}"}
+            out["ms"] = int((time.time() - t0) * 1000)
+            if req["op"] not in ("ping", "stop", "ledger") and "error" not in out:
+                ledger.append({"op": req.get("label", req["op"]), "ms": out["ms"],
+                               "sent": len(out.get("diff", out.get("tsv", ""))), "tree": tree_bytes(page)})
+            if req["op"] == "ledger":
+                out["rows"] = ledger
+            f.write(json.dumps(out).encode() + b"\n")
+            f.flush()
+            conn.close()
+            if req["op"] == "stop":
+                break
+        vid = page.video if video else None
+        ctx.close()
+        if vid:
+            print(f"video: {vid.path()}", flush=True)
+        browser.close()
+    os.unlink(sock)
+
+
+def snapshot(page):
+    tsv = page.evaluate(EXTRACT)
+    sy = page.evaluate("window.scrollY")
+    lines = tsv.split("\n")
+    keep = [lines[0]]
+    for line in lines[1:]:
+        f = line.split("\t")
+        if sy - 40 <= int(f[6]) <= sy + H + 40:
+            keep.append(line)
+    return "\n".join(keep)
+
+
+def tree_bytes(page):
+    try:
+        return len(page.locator("body").aria_snapshot(timeout=2000))
+    except Exception:
+        return 0
+
+
+def settle(page):
+    try:
+        page.wait_for_load_state("load", timeout=3000)
+    except Exception:
+        pass
+    page.wait_for_timeout(600)
+
+
+def resolve(last, target, index):
+    rows = parse(last)
+    if target.startswith("e") and target[1:].isdigit():
+        hits = [r for r in rows if r["id"] == target]
+    else:
+        t = target.casefold()
+        hits = [r for r in rows if r["label"].casefold() == t]
+        if not hits:
+            hits = [r for r in rows if t in r["label"].casefold()]
+    if not hits:
+        raise ValueError(f"no element matching {target!r}")
+    if len(hits) > 1 and not index:
+        opts = "; ".join(f"{r['id']}:{r['label'][:25]}@{r['cx']},{r['cy']}" for r in hits[:6])
+        raise ValueError(f"{len(hits)} matches for {target!r}: {opts} — pass an index or id")
+    return hits[(index or 1) - 1]
+
+
+def act_result(page, state):
+    new = snapshot(page)
+    d = diff(parse(state["last"]), parse(new))
+    state["last"] = new
+    return {"diff": d, "url": page.url}
+
+
+def handle(page, state, req):
+    op = req["op"]
+    if op in ("ping", "stop", "ledger"):
+        return {"ok": op}
+    if op == "read":
+        state["last"] = snapshot(page)
+        return {"tsv": state["last"], "url": page.url}
+    if op == "click":
+        r = resolve(state["last"], req["target"], req.get("index"))
+        page.mouse.click(r["cx"], r["cy"] - page.evaluate("window.scrollY"))
+        settle(page)
+        return act_result(page, state)
+    if op == "type":
+        page.keyboard.type(req["text"], delay=25)
+        page.wait_for_timeout(700)
+        return act_result(page, state)
+    if op == "press":
+        page.keyboard.press(req["key"])
+        settle(page)
+        return act_result(page, state)
+    if op == "goto":
+        page.goto(req["url"], wait_until="load")
+        settle(page)
+        return act_result(page, state)
+    if op == "scroll":
+        page.mouse.wheel(0, int(req["dy"]))
+        page.wait_for_timeout(500)
+        return act_result(page, state)
+    return {"error": f"unknown op {op}"}
+
+
+# ---------- client ----------
+
+def call(sock, req):
+    c = socket.socket(socket.AF_UNIX)
+    c.connect(sock)
+    f = c.makefile("rwb")
+    f.write(json.dumps(req).encode() + b"\n")
+    f.flush()
+    resp = json.loads(f.readline())
+    c.close()
+    if "error" in resp:
+        print(f"error: {resp['error']}", file=sys.stderr)
+        sys.exit(1)
+    return resp
+
+
+def alive(sock):
+    if not os.path.exists(sock):
+        return False
+    try:
+        call(sock, {"op": "ping"})
+        return True
+    except (ConnectionRefusedError, FileNotFoundError, OSError):
+        return False
+
+
+def ensure_session(name, sock, url, flags):
+    if alive(sock):
+        return call(sock, {"op": "goto", "url": url, "label": "open"})
+    STATE.mkdir(parents=True, exist_ok=True)
+    log = open(STATE / f"session-{name}.log", "w")
+    subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), "-s", name, "daemon", url, *flags],
+                     stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(60):
+        if alive(sock):
+            return call(sock, {"op": "read", "label": "open"})
+        time.sleep(0.5)
+    print(f"session {name!r} did not come up; see {STATE}/session-{name}.log", file=sys.stderr)
+    sys.exit(1)
+
+
+def emit(resp, out):
+    print(out)
+    print(f"[{len(out)}B {resp['ms']}ms]", file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="ui", description=__doc__.split("\n")[0])
+    p.add_argument("-s", "--session", default="default", help="named session, for driving several sites in parallel (default: default)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sp = sub.add_parser("open", help="start a session at URL (or navigate the live one); prints the snapshot")
+    sp.add_argument("url", help="page to open")
+    sp.add_argument("--headed", action="store_true", help="show the browser window")
+    sp.add_argument("--video", action="store_true", help="record a webm into ~/.tools/ui/video/")
+    sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
+    sp = sub.add_parser("click", help="click an element; returns the diff it caused")
+    sp.add_argument("target", help="element id (e12) or label text")
+    sp.add_argument("index", nargs="?", type=int, help="pick among multiple label matches (1-based)")
+    sp = sub.add_parser("type", help="type into the focused element; returns the diff")
+    sp.add_argument("text", help="text to type")
+    sp = sub.add_parser("press", help="press a key (Enter, Tab, Escape); returns the diff")
+    sp.add_argument("key", help="key name")
+    sp = sub.add_parser("goto", help="navigate the session; returns the diff")
+    sp.add_argument("url", help="destination URL")
+    sp = sub.add_parser("scroll", help="scroll vertically; returns the diff")
+    sp.add_argument("dy", type=int, help="pixels down (negative scrolls up)")
+    sub.add_parser("ledger", help="per-action cost vs accessibility-tree and screenshot baselines")
+    sub.add_parser("ping", help="check whether the session is alive")
+    sub.add_parser("stop", help="end the session")
+    sp = sub.add_parser("daemon", help="(internal) run the session process")
+    sp.add_argument("url")
+    sp.add_argument("--headed", action="store_true")
+    sp.add_argument("--video", action="store_true")
+    a = p.parse_args()
+
+    sock = str(STATE / f"{a.session}.sock")
+    if a.cmd == "daemon":
+        STATE.mkdir(parents=True, exist_ok=True)
+        run_daemon(a.url, sock, headed=a.headed, video=a.video)
+        return
+    if a.cmd == "open":
+        flags = (["--headed"] if a.headed else []) + (["--video"] if a.video else [])
+        resp = ensure_session(a.session, sock, a.url, flags)
+        emit(resp, resp.get("tsv") or resp.get("diff", ""))
+        return
+    if not alive(sock):
+        print(f"no live session {a.session!r} — start one with: ui open URL", file=sys.stderr)
+        sys.exit(1)
+
+    req = {"op": a.cmd}
+    if a.cmd == "click":
+        req.update(target=a.target, label=f"click {a.target[:20]}")
+        if a.index:
+            req["index"] = a.index
+    elif a.cmd == "type":
+        req.update(text=a.text, label=f"type {a.text[:20]}")
+    elif a.cmd == "press":
+        req.update(key=a.key, label=f"press {a.key}")
+    elif a.cmd == "goto":
+        req.update(url=a.url, label="goto")
+    elif a.cmd == "scroll":
+        req.update(dy=a.dy, label=f"scroll {a.dy}")
+    resp = call(sock, req)
+    if a.cmd == "ledger":
+        for r in resp["rows"]:
+            print(f"{r['op']:<26}{r['ms']:>6}ms{r['sent']:>8}B sent   (tree {r['tree']}B, screenshot ~{SCREENSHOT_TOKENS}tok)")
+    else:
+        emit(resp, resp.get("diff") or resp.get("tsv") or resp.get("ok", ""))
+
+
+if __name__ == "__main__":
+    main()
