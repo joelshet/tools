@@ -140,7 +140,7 @@ def diff(old, new):
 
 # ---------- daemon ----------
 
-def run_daemon(url, sock, headed=False, video=False):
+def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
     from playwright.sync_api import sync_playwright
 
     if os.path.exists(sock):
@@ -150,15 +150,19 @@ def run_daemon(url, sock, headed=False, video=False):
     srv.listen(1)
     ledger = []
     with sync_playwright() as pl:
-        browser = pl.chromium.launch(headless=not headed)
         ctx_opts = {"viewport": {"width": W, "height": H}}
         if video:
             (STATE / "video").mkdir(parents=True, exist_ok=True)
             ctx_opts.update(record_video_dir=str(STATE / "video"), record_video_size={"width": W, "height": H})
-        ctx = browser.new_context(**ctx_opts)
+        if profile_dir:
+            # logged-in sessions: cookies and storage persist in the profile
+            ctx = pl.chromium.launch_persistent_context(str(profile_dir), headless=not headed, **ctx_opts)
+        else:
+            browser = pl.chromium.launch(headless=not headed)
+            ctx = browser.new_context(**ctx_opts)
         if headed or video:
             ctx.add_init_script(RIPPLE)
-        page = ctx.new_page()
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(url, wait_until="load")
         page.wait_for_timeout(1500)
 
@@ -188,7 +192,8 @@ def run_daemon(url, sock, headed=False, video=False):
         ctx.close()
         if vid:
             print(f"video: {vid.path()}", flush=True)
-        browser.close()
+        if not profile_dir:
+            browser.close()
     os.unlink(sock)
 
 
@@ -328,6 +333,7 @@ def main():
     sp.add_argument("url", help="page to open")
     sp.add_argument("--headed", action="store_true", help="show the browser window")
     sp.add_argument("--video", action="store_true", help="record a webm into ~/.tools/ui/video/")
+    sp.add_argument("--profile", action="store_true", help="persistent profile for this session name: log in once (headed), stay logged in")
     sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
     sp = sub.add_parser("click", help="click an element; returns the diff it caused")
     sp.add_argument("target", help="element id (e12) or label text")
@@ -347,15 +353,17 @@ def main():
     sp.add_argument("url")
     sp.add_argument("--headed", action="store_true")
     sp.add_argument("--video", action="store_true")
+    sp.add_argument("--profile", action="store_true")
     a = p.parse_args()
 
     sock = str(STATE / f"{a.session}.sock")
     if a.cmd == "daemon":
         STATE.mkdir(parents=True, exist_ok=True)
-        run_daemon(a.url, sock, headed=a.headed, video=a.video)
+        pdir = STATE / f"profile-{a.session}" if a.profile else None
+        run_daemon(a.url, sock, headed=a.headed, video=a.video, profile_dir=pdir)
         return
     if a.cmd == "open":
-        flags = (["--headed"] if a.headed else []) + (["--video"] if a.video else [])
+        flags = [f for f, on in [("--headed", a.headed), ("--video", a.video), ("--profile", a.profile)] if on]
         resp = ensure_session(a.session, sock, a.url, flags)
         emit(resp, resp.get("tsv") or resp.get("diff", ""))
         return
