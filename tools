@@ -7,6 +7,29 @@ BOLD='\033[1m'
 DIM='\033[2m'
 RST='\033[0m'
 
+case "$1" in
+    --help|-h)
+        printf 'Usage: tools [NAME|doctor]\n\ntools: list available tools with descriptions.\nNAME: show that tool'"'"'s full --help. doctor: check every tool'"'"'s\n--help contract (exit 0, stdin closed) and flag stray artifacts.\n'
+        exit 0 ;;
+    doctor)
+        fail=0
+        for f in "$DIR"/*; do
+            [ -f "$f" ] && [ -x "$f" ] || continue
+            name=$(basename "$f")
+            case "$name" in README*|*.md) continue ;; esac
+            if "$f" --help </dev/null >/dev/null 2>&1; then
+                printf "  ok    %s\n" "$name"
+            else
+                printf "  FAIL  %s (--help exited nonzero)\n" "$name" >&2
+                fail=1
+            fi
+        done
+        for junk in __pycache__ .DS_Store; do
+            [ -e "$DIR/$junk" ] && { printf "  FAIL  %s present in ~/tools\n" "$junk" >&2; fail=1; }
+        done
+        exit $fail ;;
+esac
+
 # Detail view: tools <name> shows full help
 if [ -n "$1" ]; then
     tool="$DIR/$1"

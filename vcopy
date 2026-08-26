@@ -6,6 +6,11 @@
 #        vcopy < file.md
 set -e
 
+case "$1" in --help|-h)
+    printf 'Usage: vcopy [FILE]\n\nvcopy: vale-gated clipboard copy. Runs vale on input; copies to the\nclipboard only if checks pass. Reads FILE or stdin.\n'
+    exit 0 ;;
+esac
+
 tmp=$(mktemp /tmp/vcopy.XXXXXX.md)
 trap 'rm -f "$tmp"' EXIT
 

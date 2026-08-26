@@ -2,6 +2,11 @@
 # again — re-run a previous tool invocation
 set -e
 
+case "$1" in --help|-h)
+    printf 'Usage: again [TOOL] [N]\n\nagain: re-run a previous tool invocation. No args: show recent history.\nTOOL: re-run its last invocation. N: the Nth most recent instead.\n'
+    exit 0 ;;
+esac
+
 HIST="$HOME/.tools/history.tsv"
 BOLD='\033[1m'
 DIM='\033[2m'
