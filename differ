@@ -1,4 +1,8 @@
-#!/Users/joel/.tools/.venv/bin/python3
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
 """Word-level diff viewer for content files."""
 
 import argparse
