@@ -13,6 +13,8 @@ Any language works — Python, Rust, shell, Go — as long as it's executable an
 6. **stdin when it makes sense.** Accept piped input as an alternative to file arguments.
 7. **Exit 0 on success, 1 on error, 2 on bad usage.**
 8. **Don't touch cwd.** No temp files, no logs, no dotfiles in the user's content directory.
+9. **State lives in `~/.tools/<tool>/`.** Sockets, logs, caches, recordings. Never in ~/tools, never in cwd. Durable config may be a dotfile in ~/tools (like `.vale.ini`).
+10. **One tool, one file, deps declared.** No sibling imports (that's how `__pycache__` appears). Python tools carry a PEP 723 header naming their dependencies, so `uv run <tool>` works on a cold machine. A tool that needs to be a folder lives in its own repo (like vgrep) and only ~/tools belongs on $PATH.
 
 ## Creating a tool
 
@@ -228,6 +230,7 @@ options:                               ← section header
 
 ```
 tools              list all tools with descriptions
+tools doctor       check every tool's --help contract; run after add or prune
 tools <name>       show full --help for a tool
 guide <tool>       interactive prompts, pre-filled from last use
 again              show recent run history
@@ -256,3 +259,15 @@ grep batches ~/.tools/history.tsv          # all batches runs
 tail -5 ~/.tools/history.tsv               # last 5 runs of anything
 grep "2026-02" ~/.tools/history.tsv        # everything this month
 ```
+
+## Maintenance
+
+~/tools is a git repo. Prune boldly; history is the undo. The loop when
+adding, changing, or removing a tool:
+
+```sh
+tools doctor       # every tool still honors its contract
+git add -A && git commit -m "..."
+```
+
+vgrep/ is its own repo and is gitignored here.
