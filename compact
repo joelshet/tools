@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""compact — trim fat from Claude Code session files.
+
+Keeps conversation structure intact (resumable) but truncates
+verbose tool results, strips thinking blocks, and drops disk-only
+entries like file-history-snapshots and queue operations.
+
+Usage:
+    compact                     # dry-run on most recent session in cwd
+    compact --apply             # apply to most recent session
+    compact <session.jsonl>     # dry-run on specific file
+    compact <session.jsonl> --apply
+    compact --all               # dry-run on all sessions for cwd
+    compact --all --apply       # apply to all
+
+Options:
+    --apply                     write changes (default is dry-run)
+    --all                       process all sessions for current project
+    --tool-result-max N         max chars to keep per tool result (default 500)
+    --keep-thinking             keep thinking blocks (default: strip)
+    --keep-snapshots            keep file-history-snapshots (default: strip)
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def find_project_dir():
+    """Find the Claude session directory for the current working directory."""
+    cwd = os.getcwd()
+    # Claude Code replaces all non-alphanumeric chars with hyphens
+    encoded = ""
+    for c in cwd:
+        encoded += c if c.isalnum() else "-"
+    if not encoded.startswith("-"):
+        encoded = "-" + encoded
+    base = Path.home() / ".claude" / "projects" / encoded
+    if base.exists():
+        return base
+    return None
+
+
+def find_latest_session(project_dir):
+    """Find the most recently modified .jsonl in the project dir."""
+    sessions = sorted(
+        project_dir.glob("*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return sessions[0] if sessions else None
+
+
+def compact_session(path, tool_max=500, strip_thinking=True,
+                    strip_snapshots=True, apply=False):
+    """Compact a single session file. Returns (before, after) byte counts."""
+    with open(path) as f:
+        lines = f.readlines()
+
+    # Find last compact_boundary
+    boundary = -1
+    for i, line in enumerate(lines):
+        obj = json.loads(line)
+        if (obj.get("type") == "system"
+                and obj.get("subtype") == "compact_boundary"):
+            boundary = i
+
+    # Only process the active portion (after boundary)
+    start = boundary + 1 if boundary >= 0 else 0
+    prefix = lines[:start]  # keep dead context untouched
+    active = lines[start:]
+
+    before_bytes = sum(len(l) for l in active)
+    new_active = []
+    stats = {"snapshots": 0, "queue_ops": 0, "thinking": 0,
+             "tool_results_trimmed": 0, "tool_results_bytes_saved": 0}
+
+    for line in active:
+        obj = json.loads(line)
+        t = obj.get("type", "")
+
+        # Drop disk-only entries
+        if strip_snapshots and t == "file-history-snapshot":
+            stats["snapshots"] += 1
+            continue
+        if t == "queue-operation":
+            stats["queue_ops"] += 1
+            continue
+
+        # Trim tool results in user messages
+        if t == "user":
+            content = obj.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                new_content = []
+                for block in content:
+                    if block.get("type") == "tool_result":
+                        block, saved = _trim_tool_result(block, tool_max)
+                        if saved > 0:
+                            stats["tool_results_trimmed"] += 1
+                            stats["tool_results_bytes_saved"] += saved
+                    new_content.append(block)
+                obj["message"]["content"] = new_content
+
+        # Strip or trim thinking blocks
+        if t == "assistant" and strip_thinking:
+            content = obj.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                new_content = []
+                for block in content:
+                    if block.get("type") == "thinking":
+                        stats["thinking"] += 1
+                        continue
+                    new_content.append(block)
+                obj["message"]["content"] = new_content
+
+        new_active.append(json.dumps(obj, separators=(",", ":")) + "\n")
+
+    after_bytes = sum(len(l) for l in new_active)
+    ratio = before_bytes / max(after_bytes, 1)
+
+    return {
+        "path": path,
+        "before": before_bytes,
+        "after": after_bytes,
+        "ratio": ratio,
+        "stats": stats,
+        "prefix": prefix,
+        "new_active": new_active,
+        "had_boundary": boundary >= 0,
+        "apply": apply,
+    }
+
+
+def _trim_tool_result(block, max_chars):
+    """Trim a tool_result block's content. Returns (block, bytes_saved)."""
+    block = dict(block)  # shallow copy
+    content = block.get("content", "")
+    saved = 0
+
+    if isinstance(content, str):
+        if len(content) > max_chars:
+            saved = len(content) - max_chars
+            block["content"] = (
+                content[:max_chars]
+                + f"\n[...trimmed {saved:,} chars]"
+            )
+    elif isinstance(content, list):
+        new_blocks = []
+        for b in content:
+            if (b.get("type") == "text"
+                    and len(b.get("text", "")) > max_chars):
+                original = len(b["text"])
+                trimmed = original - max_chars
+                saved += trimmed
+                b = dict(b)
+                b["text"] = (
+                    b["text"][:max_chars]
+                    + f"\n[...trimmed {trimmed:,} chars]"
+                )
+            new_blocks.append(b)
+        block["content"] = new_blocks
+
+    return block, saved
+
+
+def fmt(b):
+    if b >= 1024 * 1024:
+        return f"{b / 1024 / 1024:.1f}MB"
+    if b >= 1024:
+        return f"{b / 1024:.0f}KB"
+    return f"{b}b"
+
+
+def print_report(result):
+    name = result["path"].name
+    s = result["stats"]
+    print(f"  {name}")
+    print(f"    {fmt(result['before'])} -> {fmt(result['after'])} "
+          f"({result['ratio']:.1f}x)")
+    if result["had_boundary"]:
+        print(f"    (had existing compact boundary)")
+    parts = []
+    if s["snapshots"]:
+        parts.append(f"{s['snapshots']} snapshots dropped")
+    if s["queue_ops"]:
+        parts.append(f"{s['queue_ops']} queue ops dropped")
+    if s["thinking"]:
+        parts.append(f"{s['thinking']} thinking blocks stripped")
+    if s["tool_results_trimmed"]:
+        parts.append(f"{s['tool_results_trimmed']} tool results trimmed "
+                      f"({fmt(s['tool_results_bytes_saved'])} saved)")
+    if parts:
+        print(f"    {', '.join(parts)}")
+
+
+def write_result(result):
+    path = result["path"]
+    backup = path.with_suffix(".jsonl.bak")
+    os.rename(path, backup)
+    with open(path, "w") as f:
+        f.writelines(result["prefix"])
+        f.writelines(result["new_active"])
+    print(f"    written (backup: {backup.name})")
+
+
+def main():
+    args = sys.argv[1:]
+    apply = "--apply" in args
+    all_sessions = "--all" in args
+    keep_thinking = "--keep-thinking" in args
+    keep_snapshots = "--keep-snapshots" in args
+
+    tool_max = 500
+    if "--tool-result-max" in args:
+        idx = args.index("--tool-result-max")
+        tool_max = int(args[idx + 1])
+
+    # Find target file(s)
+    jsonl_args = [a for a in args if a.endswith(".jsonl")]
+
+    if jsonl_args:
+        targets = [Path(a) for a in jsonl_args]
+    elif all_sessions:
+        project_dir = find_project_dir()
+        if not project_dir:
+            print("No Claude session directory found for this cwd.")
+            sys.exit(1)
+        targets = sorted(project_dir.glob("*.jsonl"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)
+    else:
+        project_dir = find_project_dir()
+        if not project_dir:
+            print("No Claude session directory found for this cwd.")
+            sys.exit(1)
+        latest = find_latest_session(project_dir)
+        if not latest:
+            print("No sessions found.")
+            sys.exit(1)
+        targets = [latest]
+
+    if not apply:
+        print("DRY RUN (use --apply to write)\n")
+
+    total_before = 0
+    total_after = 0
+
+    for path in targets:
+        result = compact_session(
+            path,
+            tool_max=tool_max,
+            strip_thinking=not keep_thinking,
+            strip_snapshots=not keep_snapshots,
+            apply=apply,
+        )
+        total_before += result["before"]
+        total_after += result["after"]
+        print_report(result)
+        if apply:
+            write_result(result)
+
+    if len(targets) > 1:
+        ratio = total_before / max(total_after, 1)
+        print(f"\n  Total: {fmt(total_before)} -> {fmt(total_after)} "
+              f"({ratio:.1f}x)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,85 @@
+#!/bin/sh
+# tools — list available tools with descriptions
+set -e
+
+DIR="$HOME/tools"
+BOLD='\033[1m'
+DIM='\033[2m'
+RST='\033[0m'
+
+# Detail view: tools <name> shows full help
+if [ -n "$1" ]; then
+    tool="$DIR/$1"
+    if [ ! -f "$tool" ]; then
+        printf "  Unknown tool: %s\n" "$1"
+        exit 1
+    fi
+    if [ -x "$tool" ]; then
+        "$tool" --help 2>&1
+    elif head -1 "$tool" | grep -q python; then
+        python3 "$tool" --help 2>&1
+    fi
+    exit
+fi
+
+# List view: show all tools with one-line descriptions
+printf "\n  ${DIM}%s${RST}\n\n" "$DIR"
+for f in "$DIR"/*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+
+    # Skip helper tools and non-tool files
+    case "$name" in
+        tools|again|guide|README*|*.md|__pycache__) continue ;;
+    esac
+
+    # Skip non-executable (unless .py)
+    [ -x "$f" ] || echo "$name" | grep -q '\.py$' || continue
+
+    # Get description from --help
+    if [ -x "$f" ]; then
+        help=$("$f" --help 2>&1 || true)
+    elif echo "$name" | grep -q '\.py$'; then
+        help=$(python3 "$f" --help 2>&1 || true)
+    else
+        help=""
+    fi
+
+    # Extract description: first non-blank line after usage block
+    desc=$(printf '%s' "$help" | awk '
+        /^[Uu]sage:/ { in_usage=1; next }
+        in_usage && /^[[:space:]]/ { next }
+        in_usage && /^$/ { in_usage=0; next }
+        !in_usage && /^$/ { next }
+        !in_usage && /^[[:space:]]*[^-]/ { gsub(/^[[:space:]]+/,""); print; exit }
+        !in_usage && /^[^[:space:]]/ && !/arguments:|options:|commands:/ { gsub(/^[[:space:]]+/,""); print; exit }
+    ')
+
+    # Fallback: first comment line after shebang
+    if [ -z "$desc" ]; then
+        desc=$(sed -n '2,5{/^#[^!]/{ s/^#[[:space:]]*//; p; q; }}' "$f")
+    fi
+
+    printf "  ${BOLD}%-16s${RST} ${DIM}%s${RST}\n" "$name" "$desc"
+done
+
+printf "\n  ${DIM}── system cheatsheet ──${RST}\n\n"
+printf "  ${DIM}%-12s${RST} ${DIM}%s${RST}\n" \
+    "grep" "search file contents" \
+    "sort | uniq" "sort lines, remove dupes" \
+    "wc -l" "count lines" \
+    "head / tail" "first / last lines" \
+    "cut -f2" "extract columns (tsv)" \
+    "awk" "column math & filtering" \
+    "diff" "compare two files" \
+    "find . -name" "find files by name" \
+    "du -sh *" "directory sizes" \
+    "curl" "fetch URLs" \
+    "jq" "parse & filter JSON" \
+    "pbcopy" "copy stdout to clipboard" \
+    "pbpaste" "paste clipboard to stdin" \
+    "open" "open file in default app" \
+    "say" "speak text aloud"
+
+printf "\n${DIM}  run <tool>   log & execute  │  guide <tool>  prompted run${RST}\n"
+printf "${DIM}  again <tool> re-run last    │  tools <tool>  show help${RST}\n"

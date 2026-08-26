@@ -1,0 +1,976 @@
+#!/Users/joel/.tools/.venv/bin/python3
+"""Word-level diff viewer for content files."""
+
+import argparse
+import hashlib
+import html as html_module
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+# ── Format detection ──
+
+EXT_MAP = {
+    ".html": "html", ".htm": "html", ".xml": "html", ".xhtml": "html",
+    ".json": "json", ".geojson": "json",
+    ".md": "markdown", ".markdown": "markdown", ".mdx": "markdown",
+    ".txt": "text", ".text": "text", ".log": "text",
+    ".csv": "text", ".tsv": "text",
+}
+
+
+def detect_type(path, content):
+    ext = Path(path).suffix.lower()
+    if ext in EXT_MAP:
+        return EXT_MAP[ext]
+    stripped = content.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(stripped)
+            return "json"
+        except json.JSONDecodeError:
+            pass
+    if re.match(r"<(!DOCTYPE|html|head|body|div|article|section|p\b)", stripped, re.I):
+        return "html"
+    if re.search(r"^#{1,6}\s", stripped, re.MULTILINE):
+        return "markdown"
+    return "text"
+
+
+# ── Normalization ──
+
+def normalize_html(text):
+    from lxml import etree
+    try:
+        doc = etree.HTML(text)
+        return etree.tostring(doc, encoding="unicode", method="html", pretty_print=True)
+    except Exception:
+        return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_json(text):
+    try:
+        obj = json.loads(text)
+        return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
+    except json.JSONDecodeError:
+        return text
+
+
+def normalize_markdown(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip() + "\n"
+
+
+def normalize_text(text):
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+$", "", text, flags=re.MULTILINE)
+    return text.strip() + "\n"
+
+
+NORMALIZERS = {
+    "html": normalize_html,
+    "json": normalize_json,
+    "markdown": normalize_markdown,
+    "text": normalize_text,
+}
+
+
+# ── Text extraction (strip markup for text-only view) ──
+
+def extract_text_html(text):
+    """Strip HTML tags, decode entities, return plain text."""
+    from lxml import etree
+    try:
+        doc = etree.HTML(text)
+        return etree.tostring(doc, method="text", encoding="unicode") or ""
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", html_module.unescape(text))
+
+
+def extract_text_json(text):
+    """Extract all string values from JSON, stripping any embedded HTML."""
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    strings = []
+    def strip_html(s):
+        s = html_module.unescape(s)
+        s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+        s = re.sub(r"<[^>]+>", " ", s)
+        s = re.sub(r"  +", " ", s)
+        return s.strip()
+    def walk(v):
+        if isinstance(v, str):
+            cleaned = strip_html(v) if ("<" in v or "&" in v) else v
+            if cleaned:
+                strings.append(cleaned)
+        elif isinstance(v, dict):
+            for k in sorted(v.keys()):
+                strings.append(f"{k}:")
+                walk(v[k])
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+    walk(obj)
+    return "\n".join(strings)
+
+
+def pretty_html(text):
+    """Put HTML tags on their own lines for readable source diffs."""
+    # Insert newlines before block-level tags
+    text = re.sub(r"(<(?:div|p|br|h[1-6]|ul|ol|li|table|tr|td|th|section|article|header|footer|nav|aside|main|details|summary|blockquote|pre|figure|figcaption|form|fieldset|strong|em|a |img |span |/div|/p|/h[1-6]|/ul|/ol|/li|/table|/tr|/td|/th|/section|/article|/header|/footer|/nav|/aside|/main|/details|/summary|/blockquote|/pre|/figure|/figcaption|/form|/fieldset))", r"\n\1", text)
+    # Collapse multiple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ── Diff engines ──
+
+def diff_words_tokenize(text):
+    """Split text into word tokens preserving whitespace as separate tokens."""
+    return re.findall(r"\S+|\s+", text)
+
+
+def diff_prose(old_text, new_text):
+    import diff_match_patch as dmp_module
+    dmp = dmp_module.diff_match_patch()
+
+    # Word-level diffing: map words → unique chars, diff, then expand
+    old_words = diff_words_tokenize(old_text)
+    new_words = diff_words_tokenize(new_text)
+
+    vocab = {}
+    def word_to_char(w):
+        if w not in vocab:
+            vocab[w] = chr(len(vocab) + 0x100)
+        return vocab[w]
+
+    old_encoded = "".join(word_to_char(w) for w in old_words)
+    new_encoded = "".join(word_to_char(w) for w in new_words)
+
+    char_to_word = {v: k for k, v in vocab.items()}
+
+    diffs = dmp.diff_main(old_encoded, new_encoded, False)
+    dmp.diff_cleanupSemantic(diffs)
+
+    inline_parts = []
+    old_parts = []
+    new_parts = []
+    added_words = 0
+    removed_words = 0
+
+    for op, encoded in diffs:
+        text = "".join(char_to_word.get(c, c) for c in encoded)
+        escaped = html_module.escape(text).replace("\n", "<br>\n")
+        if op == 0:
+            inline_parts.append(f'<span class="eq">{escaped}</span>')
+            old_parts.append(f'<span class="eq">{escaped}</span>')
+            new_parts.append(f'<span class="eq">{escaped}</span>')
+        elif op == -1:
+            inline_parts.append(f'<del>{escaped}</del>')
+            old_parts.append(f'<del>{escaped}</del>')
+            removed_words += len(text.split())
+        elif op == 1:
+            inline_parts.append(f'<ins>{escaped}</ins>')
+            new_parts.append(f'<ins>{escaped}</ins>')
+            added_words += len(text.split())
+
+    return {
+        "inline": "".join(inline_parts),
+        "split_old": "".join(old_parts),
+        "split_new": "".join(new_parts),
+        "stats": {"added": added_words, "removed": removed_words},
+    }
+
+
+def diff_html_content(old_text, new_text):
+    from lxml.html.diff import htmldiff
+    try:
+        merged = htmldiff(old_text, new_text)
+    except Exception:
+        return diff_prose(old_text, new_text)
+
+    # Pretty-printed source diff (tags on lines)
+    source_diff = diff_prose(pretty_html(old_text), pretty_html(new_text))
+
+    # Text-only diff (strip all tags)
+    old_plain = extract_text_html(old_text)
+    new_plain = extract_text_html(new_text)
+    text_diff = diff_prose(old_plain, new_plain)
+
+    # Count changes in the merged HTML
+    added = len(re.findall(r"<ins[\s>]", merged))
+    removed = len(re.findall(r"<del[\s>]", merged))
+
+    return {
+        "inline": merged,
+        "split_old": source_diff["split_old"],
+        "split_new": source_diff["split_new"],
+        "rendered_old": old_text,
+        "rendered_new": new_text,
+        "rendered_merged": merged,
+        "text_inline": text_diff["inline"],
+        "text_old": text_diff["split_old"],
+        "text_new": text_diff["split_new"],
+        "stats": {"added": added, "removed": removed},
+    }
+
+
+def diff_json_content(old_text, new_text):
+    from deepdiff import DeepDiff
+
+    old_pretty = normalize_json(old_text)
+    new_pretty = normalize_json(new_text)
+
+    try:
+        old_obj = json.loads(old_text)
+        new_obj = json.loads(new_text)
+        dd = DeepDiff(old_obj, new_obj, verbose_level=2)
+    except Exception:
+        return diff_prose(old_text, new_text)
+
+    changes = []
+    change_types = [
+        "values_changed", "dictionary_item_added", "dictionary_item_removed",
+        "iterable_item_added", "iterable_item_removed", "type_changes",
+    ]
+    for ct in change_types:
+        for path, detail in dd.get(ct, {}).items():
+            entry = {"path": path, "type": ct.replace("_", " ")}
+            if isinstance(detail, dict):
+                entry["old"] = str(detail.get("old_value", ""))
+                entry["new"] = str(detail.get("new_value", ""))
+            else:
+                entry["new"] = str(detail)
+            changes.append(entry)
+
+    # Also compute line-level diff of pretty-printed JSON for split view
+    source_diff = diff_prose(old_pretty, new_pretty)
+
+    # Text-only diff (just string values)
+    old_plain = extract_text_json(old_text)
+    new_plain = extract_text_json(new_text)
+    text_diff = diff_prose(old_plain, new_plain)
+
+    n_added = len(dd.get("dictionary_item_added", {})) + len(dd.get("iterable_item_added", {}))
+    n_removed = len(dd.get("dictionary_item_removed", {})) + len(dd.get("iterable_item_removed", {}))
+    n_changed = len(dd.get("values_changed", {})) + len(dd.get("type_changes", {}))
+
+    return {
+        "inline": source_diff["inline"],
+        "split_old": source_diff["split_old"],
+        "split_new": source_diff["split_new"],
+        "text_inline": text_diff["inline"],
+        "text_old": text_diff["split_old"],
+        "text_new": text_diff["split_new"],
+        "changes": changes,
+        "stats": {"added": n_added, "removed": n_removed, "changed": n_changed},
+    }
+
+
+def diff_markdown_content(old_text, new_text):
+    import markdown as md_lib
+
+    source_diff = diff_prose(old_text, new_text)
+
+    # Rendered view: convert to HTML and diff
+    old_html = md_lib.markdown(old_text)
+    new_html = md_lib.markdown(new_text)
+    try:
+        from lxml.html.diff import htmldiff
+        rendered_merged = htmldiff(old_html, new_html)
+    except Exception:
+        rendered_merged = None
+
+    result = source_diff.copy()
+    if rendered_merged:
+        result["rendered_old"] = old_html
+        result["rendered_new"] = new_html
+        result["rendered_merged"] = rendered_merged
+    return result
+
+
+DIFFERS = {
+    "html": diff_html_content,
+    "json": diff_json_content,
+    "markdown": diff_markdown_content,
+    "text": diff_prose,
+}
+
+
+# ── Plain text output ──
+
+def diff_txt(old_text, new_text, old_name="old", new_name="new"):
+    import difflib
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    return "".join(difflib.unified_diff(old_lines, new_lines,
+                                        fromfile=old_name, tofile=new_name))
+
+
+# ── Git integration ──
+
+def git_run(*cmd):
+    r = subprocess.run(["git"] + list(cmd), capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return r.stdout
+
+
+def git_show(ref, path):
+    return git_run("show", f"{ref}:{path}")
+
+
+def git_root():
+    r = git_run("rev-parse", "--show-toplevel")
+    return r.strip() if r else None
+
+
+def resolve_inputs(args):
+    """Return list of (name, old_text, new_text) tuples."""
+    files = []
+
+    if args.staged:
+        names = git_run("diff", "--staged", "--name-only")
+        if not names:
+            print("no staged changes", file=sys.stderr)
+            sys.exit(0)
+        root = git_root()
+        for name in names.strip().splitlines():
+            old = git_show("HEAD", name) or ""
+            new = git_show(":", name) or ""
+            files.append((name, old, new))
+        return files
+
+    if args.commit:
+        names = git_run("diff-tree", "--no-commit-id", "-r", "--name-only", args.commit)
+        if not names:
+            print(f"no changes in {args.commit}", file=sys.stderr)
+            sys.exit(0)
+        for name in names.strip().splitlines():
+            old = git_show(f"{args.commit}~1", name) or ""
+            new = git_show(args.commit, name) or ""
+            files.append((name, old, new))
+        return files
+
+    old_arg = args.old
+    new_arg = args.new
+
+    # Range: differ HEAD~3.. file or differ main..feature
+    if old_arg and ".." in old_arg:
+        ref_range = old_arg
+        specific_file = new_arg
+        names_cmd = ["diff", "--name-only", ref_range]
+        if specific_file:
+            names_cmd.append("--")
+            names_cmd.append(specific_file)
+        names = git_run(*names_cmd)
+        if not names:
+            print(f"no changes in {ref_range}", file=sys.stderr)
+            sys.exit(0)
+        parts = ref_range.split("..")
+        old_ref = parts[0] or "HEAD"
+        new_ref = parts[1] if parts[1] else "HEAD"
+        for name in names.strip().splitlines():
+            old = git_show(old_ref, name) or ""
+            new = git_show(new_ref, name) or ""
+            files.append((name, old, new))
+        return files
+
+    # Single file: differ file.html → working copy vs HEAD
+    if old_arg and not new_arg and old_arg != "-":
+        path = Path(old_arg)
+        if not path.exists():
+            print(f"file not found: {old_arg}", file=sys.stderr)
+            sys.exit(2)
+        # Get path relative to git root
+        root = git_root()
+        if root:
+            try:
+                rel = path.resolve().relative_to(Path(root).resolve())
+                old_content = git_show("HEAD", str(rel))
+                if old_content is not None:
+                    new_content = path.read_text(encoding="utf-8", errors="replace")
+                    return [(str(rel), old_content, new_content)]
+            except (ValueError, TypeError):
+                pass
+        print(f"not in a git repo or no HEAD version: {old_arg}", file=sys.stderr)
+        sys.exit(1)
+
+    # Two explicit files
+    if not old_arg:
+        print("no input files", file=sys.stderr)
+        sys.exit(2)
+
+    old_text = sys.stdin.read() if old_arg == "-" else Path(old_arg).read_text(encoding="utf-8", errors="replace")
+    if not new_arg:
+        print("need two files (or use git mode)", file=sys.stderr)
+        sys.exit(2)
+    new_text = Path(new_arg).read_text(encoding="utf-8", errors="replace")
+    name = Path(new_arg).name
+    return [(name, old_text, new_text)]
+
+
+# ── HTML viewer template ──
+
+TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>differ: {title}</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; }}
+
+/* Header */
+header {{
+  padding: 12px 20px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}}
+header h1 {{ font-size: 14px; font-weight: 600; color: #94a3b8; }}
+header h1 b {{ color: #e2e8f0; }}
+.stats {{ font-size: 13px; margin-left: auto; }}
+.stat-add {{ color: #4ade80; }}
+.stat-del {{ color: #f87171; }}
+.stat-chg {{ color: #fbbf24; }}
+
+/* Toolbar */
+nav {{
+  padding: 8px 20px;
+  background: #16213e;
+  border-bottom: 1px solid #0f3460;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px;
+}}
+nav .group {{ display: flex; gap: 2px; }}
+nav button {{
+  padding: 4px 12px; border: 1px solid #334155; border-radius: 4px;
+  background: #1e293b; color: #94a3b8; cursor: pointer; font-size: 12px;
+}}
+nav button:hover {{ background: #334155; color: #e2e8f0; }}
+nav button.active {{ background: #0f3460; color: #60a5fa; border-color: #2563eb; }}
+nav .sep {{ width: 1px; height: 20px; background: #334155; margin: 0 8px; }}
+.change-nav {{ font-size: 12px; color: #64748b; }}
+.change-nav button {{ font-size: 11px; padding: 2px 8px; }}
+
+/* Layout */
+.layout {{ display: flex; height: calc(100vh - 90px); }}
+
+/* Sidebar */
+.sidebar {{
+  width: 200px; background: #0f172a; border-right: 1px solid #1e293b;
+  overflow-y: auto; flex-shrink: 0; display: {sidebar_display};
+}}
+.sidebar .file {{
+  padding: 8px 12px; font-size: 12px; cursor: pointer;
+  border-left: 3px solid transparent; color: #94a3b8;
+}}
+.sidebar .file:hover {{ background: #1e293b; }}
+.sidebar .file.active {{ border-left-color: #60a5fa; color: #e2e8f0; background: #1e293b; }}
+.sidebar .file .fstats {{ font-size: 10px; color: #64748b; }}
+
+/* Main content */
+.content {{ flex: 1; overflow-y: auto; padding: 24px; }}
+.content.split {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1px; padding: 0; }}
+.content.triple {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; padding: 0; }}
+.pane {{
+  padding: 24px; overflow-y: auto; overflow-x: auto;
+  font-family: 'SF Mono', 'Consolas', 'Monaco', monospace; font-size: 13px;
+  line-height: 1.7; white-space: pre-wrap; word-wrap: break-word;
+}}
+.pane.old {{ background: #1a1a2e; border-right: 1px solid #1e293b; }}
+.pane.mid {{ background: #1e1e32; border-right: 1px solid #1e293b; }}
+.pane.new {{ background: #1a1a2e; }}
+.pane-label {{
+  position: sticky; top: 0; background: #0f172a; padding: 6px 12px;
+  font-size: 11px; font-weight: 600; color: #64748b; text-transform: uppercase;
+  letter-spacing: 0.05em; border-bottom: 1px solid #1e293b; z-index: 1;
+  font-family: -apple-system, system-ui, sans-serif;
+}}
+
+/* Diff markers */
+ins {{
+  background: rgba(74, 222, 128, 0.15); text-decoration: none;
+  border-bottom: 2px solid #4ade80; padding: 1px 2px; border-radius: 2px;
+  color: #bbf7d0;
+}}
+del {{
+  background: rgba(248, 113, 113, 0.15); text-decoration: line-through;
+  padding: 1px 2px; border-radius: 2px; color: #fca5a5;
+}}
+.change-focus {{ outline: 2px solid #60a5fa; outline-offset: 2px; border-radius: 2px; }}
+
+/* Inline prose view */
+.prose {{
+  font-family: 'Georgia', 'Charter', serif; font-size: 16px;
+  line-height: 1.8; max-width: 800px; margin: 0 auto;
+}}
+
+/* Rendered view */
+.rendered {{ max-width: 900px; margin: 0 auto; }}
+.rendered ins {{ background: rgba(74, 222, 128, 0.2); border-bottom: 2px solid #4ade80; }}
+.rendered del {{ background: rgba(248, 113, 113, 0.2); color: #fca5a5; }}
+
+/* Summary view */
+.summary {{ max-width: 800px; margin: 0 auto; }}
+.summary table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+.summary th {{ text-align: left; padding: 8px; border-bottom: 2px solid #334155; color: #94a3b8; font-weight: 600; }}
+.summary td {{ padding: 8px; border-bottom: 1px solid #1e293b; font-family: monospace; }}
+.summary .path {{ color: #60a5fa; }}
+.summary .type {{ color: #94a3b8; font-size: 11px; }}
+.summary .old-val {{ color: #fca5a5; }}
+.summary .new-val {{ color: #bbf7d0; }}
+
+/* Collapsed sections */
+details.unchanged {{ margin: 8px 0; }}
+details.unchanged summary {{
+  cursor: pointer; color: #475569; font-style: italic; font-size: 12px;
+  padding: 4px 0;
+}}
+details.unchanged summary:hover {{ color: #94a3b8; }}
+
+/* Keyboard help */
+.help-overlay {{
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+  z-index: 100; justify-content: center; align-items: center;
+}}
+.help-overlay.show {{ display: flex; }}
+.help-box {{
+  background: #1e293b; border: 1px solid #334155; border-radius: 8px;
+  padding: 24px; max-width: 400px; font-size: 13px;
+}}
+.help-box h2 {{ margin-bottom: 12px; font-size: 16px; color: #e2e8f0; }}
+.help-box kbd {{
+  display: inline-block; background: #334155; border-radius: 3px;
+  padding: 1px 6px; font-family: monospace; font-size: 12px; color: #e2e8f0;
+}}
+.help-box table td {{ padding: 4px 12px 4px 0; }}
+
+/* No changes */
+.no-changes {{ text-align: center; padding: 80px; color: #64748b; font-size: 18px; }}
+
+/* Identical files */
+.identical {{ text-align: center; padding: 80px 20px; }}
+.identical p {{ color: #4ade80; font-size: 20px; margin-bottom: 8px; }}
+.identical span {{ color: #64748b; font-size: 14px; }}
+
+@media print {{
+  body {{ background: white; color: black; }}
+  header, nav, .sidebar {{ display: none !important; }}
+  ins {{ background: #d4edda; border-bottom-color: #28a745; color: #155724; }}
+  del {{ background: #f8d7da; color: #721c24; }}
+}}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>{header_html}</h1>
+  <span class="stats">{stats_html}</span>
+</header>
+
+<nav>
+  <span class="group">
+    <button class="active" onclick="setView('inline')" id="btn-inline">Inline</button>
+    <button onclick="setView('split')" id="btn-split">Split</button>
+    <button onclick="setView('triple')" id="btn-triple">Before | Both | After</button>
+    {extra_view_buttons}
+    <button onclick="setView('text')" id="btn-text">Text Only</button>
+    <button onclick="setView('summary')" id="btn-summary">Summary</button>
+  </span>
+  <span class="sep"></span>
+  <span class="group">
+    <button class="active" onclick="toggleNorm()" id="btn-norm">Normalized</button>
+  </span>
+  <span class="sep"></span>
+  <span class="change-nav">
+    <button onclick="navChange(-1)">&#9664; Prev</button>
+    <span id="change-counter"></span>
+    <button onclick="navChange(1)">Next &#9654;</button>
+  </span>
+  <span style="margin-left:auto;font-size:11px;color:#475569">
+    <kbd>?</kbd> help
+  </span>
+</nav>
+
+<section class="layout">
+  <aside class="sidebar" id="sidebar">{sidebar_html}</aside>
+  <main class="content" id="main">{content_html}</main>
+</section>
+
+<div class="help-overlay" id="help">
+  <div class="help-box">
+    <h2>Keyboard shortcuts</h2>
+    <table>
+      <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Next / prev change</td></tr>
+      <tr><td><kbd>f</kbd> / <kbd>F</kbd></td><td>Next / prev file</td></tr>
+      <tr><td><kbd>1</kbd>-<kbd>6</kbd></td><td>Switch view</td></tr>
+      <tr><td><kbd>n</kbd></td><td>Toggle normalization</td></tr>
+      <tr><td><kbd>?</kbd></td><td>This help</td></tr>
+      <tr><td><kbd>Esc</kbd></td><td>Close overlay</td></tr>
+    </table>
+  </div>
+</div>
+
+<script>
+const DATA = {json_data};
+
+let currentView = 'inline';
+let currentFile = 0;
+let currentChange = -1;
+let normalized = true;
+
+function setView(view) {{
+  currentView = view;
+  document.querySelectorAll('nav .group:first-child button').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('btn-' + view);
+  if (btn) btn.classList.add('active');
+  renderFile();
+}}
+
+function toggleNorm() {{
+  normalized = !normalized;
+  document.getElementById('btn-norm').classList.toggle('active', normalized);
+  renderFile();
+}}
+
+function selectFile(idx) {{
+  currentFile = idx;
+  currentChange = -1;
+  document.querySelectorAll('.sidebar .file').forEach((f, i) => f.classList.toggle('active', i === idx));
+  renderFile();
+}}
+
+function renderFile() {{
+  const f = DATA.files[currentFile];
+  if (!f) return;
+  const main = document.getElementById('main');
+  const key = normalized ? 'norm' : 'raw';
+  const d = f.diffs[key];
+
+  if (f.identical) {{
+    main.className = 'content';
+    main.innerHTML = '<div class="identical"><p>Files are identical</p><span>' + (normalized ? 'after normalization' : 'byte-for-byte') + '</span></div>';
+    return;
+  }}
+
+  if (currentView === 'inline') {{
+    main.className = 'content';
+    const cls = f.type === 'json' ? '' : 'prose';
+    main.innerHTML = '<article class="' + cls + '">' + d.inline + '</article>';
+  }} else if (currentView === 'split') {{
+    main.className = 'content split';
+    main.innerHTML =
+      '<div class="pane old"><div class="pane-label">Before</div>' + d.split_old + '</div>'
+      + '<div class="pane new"><div class="pane-label">After</div>' + d.split_new + '</div>';
+    syncScroll(main);
+  }} else if (currentView === 'triple') {{
+    main.className = 'content triple';
+    main.innerHTML =
+      '<div class="pane old"><div class="pane-label">Before</div>' + d.split_old + '</div>'
+      + '<div class="pane mid"><div class="pane-label">Changes</div>' + d.inline + '</div>'
+      + '<div class="pane new"><div class="pane-label">After</div>' + d.split_new + '</div>';
+    syncScroll(main);
+  }} else if (currentView === 'rendered' && d.rendered_merged) {{
+    main.className = 'content';
+    main.innerHTML = '<article class="rendered">' + d.rendered_merged + '</article>';
+  }} else if (currentView === 'text') {{
+    const ti = d.text_inline || d.inline;
+    const to = d.text_old || d.split_old;
+    const tn = d.text_new || d.split_new;
+    main.className = 'content triple';
+    main.innerHTML =
+      '<div class="pane old"><div class="pane-label">Before (text)</div>' + to + '</div>'
+      + '<div class="pane mid"><div class="pane-label">Changes (text)</div>' + ti + '</div>'
+      + '<div class="pane new"><div class="pane-label">After (text)</div>' + tn + '</div>';
+    syncScroll(main);
+  }} else if (currentView === 'summary') {{
+    main.className = 'content';
+    if (d.changes && d.changes.length > 0) {{
+      let rows = d.changes.map(c =>
+        '<tr><td class="path">' + esc(c.path) + '</td><td class="type">' + esc(c.type) + '</td>'
+        + '<td class="old-val">' + esc(c.old || '') + '</td><td class="new-val">' + esc(c.new || '') + '</td></tr>'
+      ).join('');
+      main.innerHTML = '<div class="summary"><table><tr><th>Path</th><th>Type</th><th>Old</th><th>New</th></tr>' + rows + '</table></div>';
+    }} else {{
+      const s = d.stats || {{}};
+      main.innerHTML = '<div class="summary"><p style="padding:40px;color:#94a3b8">Word-level changes: '
+        + '<span class="stat-add">+' + (s.added||0) + '</span> '
+        + '<span class="stat-del">-' + (s.removed||0) + '</span>'
+        + (s.changed ? ' <span class="stat-chg">~' + s.changed + '</span>' : '')
+        + '</p></div>';
+    }}
+  }} else {{
+    setView('inline');
+    return;
+  }}
+
+  // Update change counter
+  const changes = main.querySelectorAll('ins, del');
+  document.getElementById('change-counter').textContent = changes.length > 0
+    ? (currentChange + 1) + ' / ' + changes.length + ' changes'
+    : 'no changes';
+}}
+
+function navChange(dir) {{
+  const main = document.getElementById('main');
+  const changes = main.querySelectorAll('ins, del');
+  if (!changes.length) return;
+  document.querySelectorAll('.change-focus').forEach(el => el.classList.remove('change-focus'));
+  currentChange = Math.max(0, Math.min(changes.length - 1, currentChange + dir));
+  changes[currentChange].classList.add('change-focus');
+  changes[currentChange].scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+  document.getElementById('change-counter').textContent = (currentChange + 1) + ' / ' + changes.length + ' changes';
+}}
+
+function syncScroll(container) {{
+  const panes = container.querySelectorAll('.pane');
+  if (panes.length < 2) return;
+  let syncing = false;
+  panes.forEach((source) => {{
+    source.addEventListener('scroll', () => {{
+      if (syncing) return;
+      syncing = true;
+      const pct = source.scrollTop / (source.scrollHeight - source.clientHeight || 1);
+      panes.forEach((target) => {{
+        if (target !== source) {{
+          target.scrollTop = pct * (target.scrollHeight - target.clientHeight || 1);
+        }}
+      }});
+      syncing = false;
+    }});
+  }});
+}}
+
+function esc(s) {{ const d = document.createElement('span'); d.textContent = s; return d.innerHTML; }}
+
+// Keyboard
+document.addEventListener('keydown', e => {{
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  const key = e.key;
+  if (key === '?') {{ document.getElementById('help').classList.toggle('show'); e.preventDefault(); }}
+  else if (key === 'Escape') {{ document.getElementById('help').classList.remove('show'); }}
+  else if (key === 'j') navChange(1);
+  else if (key === 'k') navChange(-1);
+  else if (key === 'n') toggleNorm();
+  else if (key === 'f') {{ if (DATA.files.length > 1) selectFile(Math.min(currentFile + 1, DATA.files.length - 1)); }}
+  else if (key === 'F') {{ if (DATA.files.length > 1) selectFile(Math.max(currentFile - 1, 0)); }}
+  else if (key === '1') setView('inline');
+  else if (key === '2') setView('split');
+  else if (key === '3') setView('triple');
+  else if (key === '4') setView('rendered');
+  else if (key === '5') setView('text');
+  else if (key === '6') setView('summary');
+}});
+
+// Init
+renderFile();
+</script>
+</body>
+</html>"""
+
+
+# ── HTML generation ──
+
+def compute_file_data(name, old_text, new_text, content_type):
+    """Compute all diff representations for a file pair."""
+    differ = DIFFERS.get(content_type, diff_prose)
+    normalizer = NORMALIZERS.get(content_type, normalize_text)
+
+    old_norm = normalizer(old_text)
+    new_norm = normalizer(new_text)
+
+    raw_diff = differ(old_text, new_text)
+    norm_diff = differ(old_norm, new_norm)
+
+    identical = (old_norm == new_norm)
+
+    return {
+        "name": name,
+        "type": content_type,
+        "identical": identical,
+        "diffs": {
+            "raw": raw_diff,
+            "norm": norm_diff,
+        },
+    }
+
+
+def build_stats_html(file_data):
+    parts = []
+    for f in file_data:
+        d = f["diffs"]["norm"]
+        s = d.get("stats", {})
+        if s.get("added"):
+            parts.append(f'<span class="stat-add">+{s["added"]}</span>')
+        if s.get("removed"):
+            parts.append(f'<span class="stat-del">-{s["removed"]}</span>')
+        if s.get("changed"):
+            parts.append(f'<span class="stat-chg">~{s["changed"]}</span>')
+    return " ".join(parts) if parts else '<span style="color:#64748b">no changes</span>'
+
+
+def build_sidebar_html(file_data):
+    if len(file_data) <= 1:
+        return ""
+    parts = []
+    for i, f in enumerate(file_data):
+        s = f["diffs"]["norm"].get("stats", {})
+        stat_str = ""
+        if s.get("added") or s.get("removed"):
+            stat_str = f'<div class="fstats">+{s.get("added",0)} -{s.get("removed",0)}</div>'
+        active = "active" if i == 0 else ""
+        parts.append(
+            f'<div class="file {active}" onclick="selectFile({i})">'
+            f'{html_module.escape(f["name"])}{stat_str}</div>'
+        )
+    return "\n".join(parts)
+
+
+def has_rendered_view(file_data):
+    for f in file_data:
+        for key in ("norm", "raw"):
+            if f["diffs"][key].get("rendered_merged"):
+                return True
+    return False
+
+
+def generate_html(file_data, old_name, new_name):
+    if len(file_data) == 1:
+        header = f'<b>{html_module.escape(file_data[0]["name"])}</b> ({file_data[0]["type"]})'
+    else:
+        header = f'<b>{len(file_data)} files</b>'
+
+    extra_buttons = ""
+    if has_rendered_view(file_data):
+        extra_buttons = '<button onclick="setView(\'rendered\')" id="btn-rendered">Rendered</button>'
+
+    sidebar_display = "block" if len(file_data) > 1 else "none"
+
+    # Prepare JSON data — serialize diff results
+    json_files = []
+    for f in file_data:
+        jf = {
+            "name": f["name"],
+            "type": f["type"],
+            "identical": f["identical"],
+            "diffs": {},
+        }
+        for key in ("raw", "norm"):
+            d = f["diffs"][key]
+            jd = {
+                "inline": d.get("inline", ""),
+                "split_old": d.get("split_old", ""),
+                "split_new": d.get("split_new", ""),
+                "stats": d.get("stats", {}),
+            }
+            if d.get("rendered_merged"):
+                jd["rendered_merged"] = d["rendered_merged"]
+            if d.get("text_inline"):
+                jd["text_inline"] = d["text_inline"]
+                jd["text_old"] = d.get("text_old", "")
+                jd["text_new"] = d.get("text_new", "")
+            if d.get("changes"):
+                jd["changes"] = d["changes"]
+            jf["diffs"][key] = jd
+        json_files.append(jf)
+
+    json_data = json.dumps({"files": json_files}, ensure_ascii=False)
+
+    # Compute initial content for first file
+    first = file_data[0]
+    d = first["diffs"]["norm"]
+    if first["identical"]:
+        content_html = '<div class="identical"><p>Files are identical</p><span>after normalization</span></div>'
+    else:
+        cls = "" if first["type"] == "json" else "prose"
+        content_html = f'<article class="{cls}">{d.get("inline", "")}</article>'
+
+    return TEMPLATE.format(
+        title=html_module.escape(f"{old_name} vs {new_name}" if new_name else old_name),
+        header_html=header,
+        stats_html=build_stats_html(file_data),
+        extra_view_buttons=extra_buttons,
+        sidebar_display=sidebar_display,
+        sidebar_html=build_sidebar_html(file_data),
+        content_html=content_html,
+        json_data=json_data,
+    )
+
+
+def open_in_browser(html_content, name):
+    name_hash = hashlib.md5(name.encode()).hexdigest()[:8]
+    tmp_path = Path(tempfile.gettempdir()) / f"differ-{name_hash}.html"
+    tmp_path.write_text(html_content, encoding="utf-8")
+    print(str(tmp_path), file=sys.stderr)
+    subprocess.run(["open", str(tmp_path)])
+
+
+# ── Main ──
+
+parser = argparse.ArgumentParser(description="Word-level diff viewer for content files")
+parser.add_argument("old", nargs="?", help="file path, git range, or - for stdin")
+parser.add_argument("new", nargs="?", help="file path (optional for git mode)")
+parser.add_argument("--type", choices=["html", "json", "markdown", "text"],
+                    help="force content type (default: auto-detect)")
+parser.add_argument("--format", choices=["browser", "txt"], default="browser",
+                    help="output format (default: browser)")
+parser.add_argument("--staged", action="store_true",
+                    help="diff all staged changes")
+parser.add_argument("--commit", metavar="REF",
+                    help="diff a specific commit")
+parser.add_argument("--no-open", action="store_true",
+                    help="write HTML, print path, don't open browser")
+
+
+def main():
+    args = parser.parse_args()
+
+    if not args.old and not args.staged and not args.commit:
+        parser.print_help()
+        sys.exit(2)
+
+    file_pairs = resolve_inputs(args)
+
+    if not file_pairs:
+        print("no files to diff", file=sys.stderr)
+        sys.exit(0)
+
+    # Plain text mode
+    if args.format == "txt":
+        for name, old_text, new_text in file_pairs:
+            print(diff_txt(old_text, new_text, f"a/{name}", f"b/{name}"))
+        return
+
+    # Compute diffs for all files
+    file_data = []
+    for name, old_text, new_text in file_pairs:
+        content_type = args.type or detect_type(name, new_text or old_text)
+        print(f"diffing {name} ({content_type})...", file=sys.stderr)
+        fd = compute_file_data(name, old_text, new_text, content_type)
+        file_data.append(fd)
+
+    old_name = args.old or "staged"
+    new_name = args.new or ""
+    html_content = generate_html(file_data, old_name, new_name)
+
+    if args.no_open:
+        name_hash = hashlib.md5(old_name.encode()).hexdigest()[:8]
+        tmp_path = Path(tempfile.gettempdir()) / f"differ-{name_hash}.html"
+        tmp_path.write_text(html_content, encoding="utf-8")
+        print(str(tmp_path))
+    else:
+        open_in_browser(html_content, old_name)
+
+
+if __name__ == "__main__":
+    main()

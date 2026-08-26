@@ -1,0 +1,98 @@
+extends: existence
+message: "'%s' sounds like AI wrote it."
+level: error
+ignorecase: true
+tokens:
+  - delve
+  - delving
+  - dive into
+  - let's dive in
+  - I'd be happy to
+  - seamless
+  - seamlessly
+  - robust
+  - cutting-edge
+  - game-changer
+  - game-changing
+  - empower
+  - empowering
+  - unlock the
+  - unlocking
+  - harness the
+  - harnessing
+  - elevate
+  - foster
+  - realm
+  - tapestry
+  - landscape
+  - moreover
+  - furthermore
+  - additionally
+  - it's worth noting
+  - in today's
+  - needless to say
+  - revolutionize
+  - transformative
+  - utilize
+  - facilitate
+  - comprehensive
+  - innovative
+  - at its core
+  - navigating the
+  - a testament to
+  - plays a crucial role
+  - multifaceted
+  - ever-evolving
+  - underscores
+  - leverage
+  - leveraging
+  - resonate
+  - resonates
+  - impactful
+  - actionable
+  - holistic
+  - learnings
+  - curated
+  - optimize
+  - optimizing
+  - aligned with
+  - deep dive
+  - key takeaway
+  - don't hesitate to
+  - feel free to
+  - reach out
+  - touch base
+  - drill down
+  - bandwidth
+  - cadence
+  - ecosystem
+  - onboarding
+  - stakeholder
+  - circle back
+  - notably
+  - essentially
+  - fundamentally
+  - ultimately
+  - certainly
+  - indeed
+  - moving forward
+  - going forward
+  - that being said
+  - having said that
+  - with that said
+  - with that in mind
+  - if you will
+  - in conclusion
+  - to sum up
+  - in summary
+  - hope this helps
+  - spearhead
+  - ideate
+  - synergize
+  - incentivize
+  - iterate on
+  - pivoting
+  - pivot to
+  - humbled
+  - honored to
+  - privileged to

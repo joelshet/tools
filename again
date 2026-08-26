@@ -1,0 +1,55 @@
+#!/bin/sh
+# again — re-run a previous tool invocation
+set -e
+
+HIST="$HOME/.tools/history.tsv"
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[32m'
+RST='\033[0m'
+
+if [ ! -f "$HIST" ]; then
+    printf "  No history yet.\n"
+    printf "  Use ${BOLD}run <tool> <args>${RST} to start logging.\n"
+    exit 0
+fi
+
+# No args: show recent history
+if [ -z "$1" ]; then
+    printf "\n  ${DIM}%s${RST}\n\n" "$HIST"
+    tail -20 "$HIST" | while IFS='	' read -r ts name cmd cwd; do
+        # Shorten cmd: remove tool path prefix
+        short=$(printf '%s' "$cmd" | sed "s|$HOME/tools/||; s|.*/||" | head -1)
+        printf "  ${DIM}%s${RST}  ${BOLD}%-12s${RST} %s  ${DIM}%s${RST}\n" \
+            "$ts" "$name" "$short" "$cwd"
+    done
+    printf "\n  ${DIM}again <tool>   re-run last   │  again <tool> 2   2nd most recent${RST}\n"
+    printf "  ${DIM}guide <tool>   prompted run  │  run <tool>       log & execute${RST}\n\n"
+    exit 0
+fi
+
+tool="$1"
+n="${2:-1}"
+
+# Find the nth most recent run of this tool
+cmd=$(grep "	$tool	" "$HIST" | tail -"$n" | head -1 | cut -f3)
+cwd=$(grep "	$tool	" "$HIST" | tail -"$n" | head -1 | cut -f4)
+
+if [ -z "$cmd" ]; then
+    printf "  No history for ${BOLD}%s${RST}\n" "$tool"
+    exit 1
+fi
+
+printf "  ${GREEN}→ %s${RST}\n" "$cmd"
+[ -n "$cwd" ] && printf "  ${DIM}(originally in %s)${RST}\n" "$cwd"
+printf "\n"
+
+# Log the re-run
+printf '%s\t%s\t%s\t%s\n' \
+    "$(date +%Y-%m-%dT%H:%M)" \
+    "$tool" \
+    "$cmd" \
+    "$PWD" >> "$HIST"
+
+# Execute
+eval "$cmd"

@@ -1,0 +1,172 @@
+#!/Users/joel/.tools/.venv/bin/python3
+"""Transcribe audio or video files to text."""
+
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def extract_audio(input_path, wav_path):
+    """Extract audio as 16kHz mono WAV."""
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+        str(wav_path),
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"ffmpeg error: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_words(words_path):
+    """Load match-words list from file (one term per line)."""
+    lines = Path(words_path).read_text().strip().splitlines()
+    return [w.strip() for w in lines if w.strip() and not w.startswith("#")]
+
+
+def transcribe(wav_path, model_name, words=None):
+    """Run faster-whisper and return segments."""
+    from faster_whisper import WhisperModel
+
+    print(f"loading model: {model_name}", file=sys.stderr)
+    model = WhisperModel(model_name, device="cpu", compute_type="int8")
+
+    kwargs = {}
+    if words:
+        kwargs["hotwords"] = ", ".join(words)
+        kwargs["initial_prompt"] = (
+            "This transcript may contain: " + ", ".join(words[:50]) + "."
+        )
+
+    print("transcribing...", file=sys.stderr)
+    segments, info = model.transcribe(
+        str(wav_path), word_timestamps=True, **kwargs
+    )
+    return list(segments), info
+
+
+def fmt_ts_srt(seconds):
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def fmt_ts_vtt(seconds):
+    """Format seconds as VTT timestamp: HH:MM:SS.mmm"""
+    return fmt_ts_srt(seconds).replace(",", ".")
+
+
+def output_srt(segments):
+    """Format as SRT."""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        lines.append(str(i))
+        lines.append(f"{fmt_ts_srt(seg.start)} --> {fmt_ts_srt(seg.end)}")
+        lines.append(seg.text.strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def output_vtt(segments):
+    """Format as WebVTT."""
+    lines = ["WEBVTT", ""]
+    for seg in segments:
+        lines.append(f"{fmt_ts_vtt(seg.start)} --> {fmt_ts_vtt(seg.end)}")
+        lines.append(seg.text.strip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+def output_txt(segments):
+    """Format as plain text."""
+    return "\n".join(seg.text.strip() for seg in segments)
+
+
+def output_tsv(segments):
+    """Format as TSV with start/end/text columns."""
+    lines = ["start_ms\tend_ms\ttext"]
+    for seg in segments:
+        start = int(seg.start * 1000)
+        end = int(seg.end * 1000)
+        lines.append(f"{start}\t{end}\t{seg.text.strip()}")
+    return "\n".join(lines)
+
+
+def output_words_tsv(segments):
+    """Format as word-level TSV."""
+    lines = ["start_ms\tend_ms\tconf\tword"]
+    for seg in segments:
+        for word in (seg.words or []):
+            start = int(word.start * 1000)
+            end = int(word.end * 1000)
+            conf = f"{word.probability:.2f}"
+            lines.append(f"{start}\t{end}\t{conf}\t{word.word.strip()}")
+    return "\n".join(lines)
+
+
+FORMATS = {
+    "srt": output_srt,
+    "vtt": output_vtt,
+    "txt": output_txt,
+    "tsv": output_tsv,
+    "words": output_words_tsv,
+}
+
+parser = argparse.ArgumentParser(description="Transcribe audio or video files to text")
+parser.add_argument("input", help="audio or video file path")
+parser.add_argument(
+    "--format", choices=list(FORMATS.keys()), default="srt",
+    help="output format (default: srt)",
+)
+parser.add_argument(
+    "--model", default="large-v3-turbo",
+    help="whisper model name (default: large-v3-turbo)",
+)
+parser.add_argument(
+    "--words", metavar="FILE",
+    help="match-words file, one term per line",
+)
+
+args = parser.parse_args()
+
+input_path = Path(args.input)
+if not input_path.exists():
+    print(f"file not found: {args.input}", file=sys.stderr)
+    sys.exit(2)
+
+# Extract audio to temp WAV
+audio_exts = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}
+is_audio = input_path.suffix.lower() in audio_exts
+
+with tempfile.TemporaryDirectory() as tmp:
+    wav_path = Path(tmp) / "audio.wav"
+
+    if input_path.suffix.lower() == ".wav":
+        wav_path = input_path
+        print("using WAV directly", file=sys.stderr)
+    else:
+        kind = "audio" if is_audio else "video"
+        print(f"extracting audio from {kind}...", file=sys.stderr)
+        extract_audio(input_path, wav_path)
+
+    # Load match words
+    words = load_words(args.words) if args.words else None
+    if words:
+        print(f"match words: {len(words)} terms loaded", file=sys.stderr)
+
+    # Transcribe
+    segments, info = transcribe(wav_path, args.model, words)
+    print(
+        f"detected language: {info.language} ({info.language_probability:.0%})",
+        file=sys.stderr,
+    )
+
+    # Output
+    formatter = FORMATS[args.format]
+    print(formatter(segments))

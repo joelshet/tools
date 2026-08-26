@@ -1,0 +1,44 @@
+extends: existence
+message: "'%s' is generic happy marketing tone."
+level: error
+ignorecase: true
+tokens:
+  - thrilled
+  - we're excited
+  - excited to announce
+  - excited to share
+  - passionate about
+  - incredible
+  - incredibly
+  - amazing opportunity
+  - absolutely
+  - can't wait to
+  - we couldn't be more
+  - love to hear
+  - great news
+  - exciting news
+  - exciting update
+  - game changing
+  - blown away
+  - couldn't be happier
+  - huge fan
+  - so grateful
+  - truly grateful
+  - beyond excited
+  - super excited
+  - stoked
+  - fantastic
+  - fabulous
+  - wonderful
+  - phenomenal
+  - mind-blowing
+  - insanely
+  - wildly
+  - hands down
+  - without a doubt
+  - it goes without saying
+  - proud to announce
+  - honored to announce
+  - humbled and
+  - truly honored
+  - deeply grateful

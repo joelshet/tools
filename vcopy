@@ -1,0 +1,23 @@
+#!/bin/sh
+# vcopy — vale-gated clipboard copy
+# Runs vale on input; copies to clipboard only if checks pass.
+# Usage: echo "text" | vcopy
+#        vcopy file.md
+#        vcopy < file.md
+set -e
+
+tmp=$(mktemp /tmp/vcopy.XXXXXX.md)
+trap 'rm -f "$tmp"' EXIT
+
+if [ -n "$1" ] && [ -f "$1" ]; then
+    cp "$1" "$tmp"
+else
+    cat > "$tmp"
+fi
+
+if vale --config "$HOME/tools/.vale.ini" "$tmp" >&2; then
+    cat "$tmp" | pbcopy
+    printf "Copied.\n" >&2
+else
+    exit 1
+fi

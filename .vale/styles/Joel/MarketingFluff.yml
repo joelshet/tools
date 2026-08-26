@@ -1,0 +1,58 @@
+extends: existence
+message: "'%s' is marketing fluff."
+level: error
+ignorecase: true
+tokens:
+  - next-level
+  - world-class
+  - best-in-class
+  - state-of-the-art
+  - end-to-end
+  - turnkey
+  - disruptive
+  - paradigm shift
+  - value proposition
+  - low-hanging fruit
+  - move the needle
+  - north star
+  - bleeding edge
+  - mission-critical
+  - thought leader
+  - synergy
+  - supercharge
+  - 10x
+  - skyrocket
+  - turbocharge
+  - pain point
+  - friction
+  - frictionless
+  - double down
+  - hyper-growth
+  - at scale
+  - out of the box
+  - circle back
+  - net-net
+  - unparalleled
+  - unprecedented
+  - reimagine
+  - reimagining
+  - best of breed
+  - no-brainer
+  - win-win
+  - value-add
+  - sweet spot
+  - secret sauce
+  - special sauce
+  - rocket ship
+  - top-notch
+  - first-rate
+  - stellar
+  - exceptional
+  - outstanding
+  - remarkable
+  - extraordinary
+  - limited time
+  - act now
+  - don't miss out
+  - exclusive offer
+  - one-time offer

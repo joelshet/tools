@@ -1,0 +1,5 @@
+extends: existence
+message: "No em dashes. Use a period, comma, colon, or parentheses instead; for ranges use 'to'."
+level: error
+raw:
+  - '[\x{2014}\x{2015}]'

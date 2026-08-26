@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""guide — interactive prompts for any tool, pre-filled from last use."""
+
+import subprocess, os, sys, re, json
+from pathlib import Path
+from datetime import datetime
+
+TOOLS_DIR = Path.home() / "tools"
+TOOLS_CFG = Path.home() / ".tools"
+HISTORY = TOOLS_CFG / "history.tsv"
+CACHE = TOOLS_CFG / "cache"
+
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+
+
+# ── Help text parsing ──
+
+def parse_help(text):
+    """Extract description and arguments from --help output."""
+    if not text.strip():
+        return {"description": "", "args": []}
+
+    lines = text.strip().splitlines()
+    i = 0
+    # Skip usage block: "usage:" line + continuation lines (indented)
+    if i < len(lines) and lines[i].lower().startswith("usage:"):
+        i += 1
+        while i < len(lines) and lines[i].startswith("  "):
+            i += 1
+    # Skip blank lines
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+
+    # Description: text until blank line, section header, or option line
+    desc_lines = []
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            break
+        if re.match(
+            r"^(positional|optional|options|arguments|commands|flags)\s*(arguments)?:",
+            line, re.I,
+        ):
+            break
+        # Stop if line looks like an option: -x or --x
+        if re.match(r"^-\w", line):
+            break
+        desc_lines.append(line)
+        i += 1
+
+    description = " ".join(desc_lines)
+    args = []
+
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+
+        # Option lines — multiple formats:
+        #   --size SIZE           desc       (argparse)
+        #   -s, --size SIZE       desc       (argparse with short)
+        #   -d, --data <data>     desc       (curl style)
+        #   -s, --silent          desc       (curl flag)
+        m = re.match(
+            r"^\s+"
+            r"(-\w),?\s+"                      # short flag: -s,  (with comma/space)
+            r"(--[\w-]+)"                      # long flag: --size
+            r"(?:[\s=]"                        # separator
+            r"(?:\{([^}]+)\}|<([^>]+)>|([A-Z][\w]*)))?"  # value
+            r"(?:\s{2,}(.*))?",                # help text
+            line,
+        )
+        if not m:
+            # Long-only format: "  --size SIZE   desc" or "  --dry-run  desc"
+            m = re.match(
+                r"^\s{2,}"
+                r"()(--[\w-]+)"                # empty short, long flag
+                r"(?:[\s=]"
+                r"(?:\{([^}]+)\}|<([^>]+)>|([A-Z][\w]*)))?"
+                r"(?:\s{2,}(.*))?",
+                line,
+            )
+        if m:
+            short = m.group(1).strip().rstrip(",").strip() if m.group(1) else ""
+            long = m.group(2)
+            choices = m.group(3).split(",") if m.group(3) else None
+            value_name = m.group(4) or m.group(5) or ""
+            help_text = m.group(6).strip() if m.group(6) else ""
+
+            while i < len(lines) and lines[i].startswith("        "):
+                help_text += " " + lines[i].strip()
+                i += 1
+
+            default = ""
+            dm = re.search(r"[\[(]default:\s*([^\])]+)[\])]", help_text, re.I)
+            if dm:
+                default = dm.group(1).strip()
+
+            if not choices:
+                cm = re.search(
+                    r"\[possible values:\s*([^\]]+)\]", help_text, re.I
+                )
+                if cm:
+                    choices = [c.strip() for c in cm.group(1).split(",")]
+
+            if long in ("--help", "--version", "-h"):
+                continue
+
+            is_flag = not value_name and not choices
+            args.append({
+                "name": long,
+                "short": short,
+                "choices": choices,
+                "default": default,
+                "help": re.sub(r"\s*[\[(]default:.*?[\])]", "", help_text).strip(),
+                "is_flag": is_flag,
+            })
+            continue
+
+        # Positional args: "  input    description"
+        m = re.match(r"^\s{2,4}(\w+|<\w+>)\s{2,}(.+)", line)
+        if m:
+            name = m.group(1).strip("<>")
+            args.append({
+                "name": name,
+                "short": "",
+                "choices": None,
+                "default": "",
+                "help": m.group(2).strip(),
+                "is_flag": False,
+                "positional": True,
+            })
+
+    return {"description": description, "args": args}
+
+
+def get_help_text(tool_path):
+    """Run tool --help and return the text."""
+    try:
+        cmd = (
+            [sys.executable, str(tool_path), "--help"]
+            if tool_path.suffix == ".py"
+            else [str(tool_path), "--help"]
+        )
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return r.stdout or r.stderr or ""
+    except Exception:
+        return ""
+
+
+def get_tool_info(tool_path):
+    """Get parsed help, cached by mtime."""
+    cache_file = CACHE / f"{tool_path.name}.json"
+    try:
+        mtime = tool_path.stat().st_mtime
+    except OSError:
+        mtime = 0
+
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            if cached.get("mtime") == mtime:
+                return cached
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    help_text = get_help_text(tool_path)
+    info = parse_help(help_text)
+    info["mtime"] = mtime
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(json.dumps(info))
+    return info
+
+
+# ── History ──
+
+def last_run(tool):
+    """Get last invocation of a tool from history."""
+    if not HISTORY.exists():
+        return None
+    for line in reversed(HISTORY.read_text().splitlines()):
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[1] == tool:
+            return {"cmd": parts[2], "cwd": parts[3] if len(parts) > 3 else ""}
+    return None
+
+
+def save_history(tool, cmd):
+    """Append to history."""
+    TOOLS_CFG.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M")
+    with open(HISTORY, "a") as f:
+        f.write(f"{ts}\t{tool}\t{cmd}\t{os.getcwd()}\n")
+
+
+def parse_last_args(cmd_str, tool_info):
+    """Extract arg values from a previous command string."""
+    parts = cmd_str.split()
+    vals = {}
+    i = 1  # skip tool path/name
+    while i < len(parts):
+        p = parts[i]
+        for arg in tool_info.get("args", []):
+            if p == arg["name"] or (arg.get("short") and p == arg["short"]):
+                if arg.get("is_flag"):
+                    vals[arg["name"]] = True
+                elif i + 1 < len(parts):
+                    i += 1
+                    vals[arg["name"]] = parts[i]
+                break
+        else:
+            for arg in tool_info.get("args", []):
+                if arg.get("positional") and arg["name"] not in vals:
+                    vals[arg["name"]] = p
+                    break
+        i += 1
+    return vals
+
+
+# ── Prompts ──
+
+def prompt(label, default="", choices=None, help_text=""):
+    """Prompt for a value. Enter accepts default."""
+    parts = [f"  {BOLD}{label}{RESET}"]
+    if help_text:
+        parts.append(f" {DIM}{help_text}{RESET}")
+    if choices:
+        parts.append(f" ({'/'.join(choices)})")
+    if default:
+        parts.append(f" {CYAN}[{default}]{RESET}")
+    parts.append(": ")
+
+    try:
+        value = input("".join(parts)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+    return value if value else str(default)
+
+
+# ── Main ──
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(f"""
+  {BOLD}guide{RESET} — interactive prompts for any tool
+
+  {BOLD}guide{RESET} <tool>    parse --help, prompt for args, run
+
+  {DIM}again          show history  │  again <tool>   re-run last{RESET}
+  {DIM}run <tool>     log & execute │  tools          list tools{RESET}
+""")
+        return
+
+    tool_name = sys.argv[1]
+    tool_path = TOOLS_DIR / tool_name
+
+    if not tool_path.exists():
+        tool_path = TOOLS_DIR / f"{tool_name}.py"
+
+    if not tool_path.exists():
+        # Check system PATH
+        import shutil
+        system_path = shutil.which(tool_name)
+        if system_path:
+            tool_path = Path(system_path)
+        else:
+            print(f"  Unknown tool: {BOLD}{tool_name}{RESET}")
+            return
+
+    info = get_tool_info(tool_path)
+    prev = last_run(tool_name)
+    last_vals = parse_last_args(prev["cmd"], info) if prev else {}
+
+    # Header
+    print(f"\n  {DIM}{tool_path}{RESET}")
+    desc = info.get("description", "")
+    if desc:
+        print(f"  {DIM}{desc}{RESET}\n")
+    else:
+        print()
+
+    # Build command
+    tool_cmd = (
+        f"python3 {tool_path}" if tool_path.suffix == ".py" else str(tool_path)
+    )
+    cmd_parts = [tool_cmd]
+    positionals = []
+
+    for arg in info.get("args", []):
+        name = arg["name"]
+        default = last_vals.get(name, arg.get("default", ""))
+        if isinstance(default, bool):
+            default = ""
+
+        if arg.get("positional"):
+            value = prompt(name, str(default), arg.get("choices"), arg.get("help", ""))
+            if value:
+                positionals.append(value)
+        elif arg.get("is_flag"):
+            was_set = bool(last_vals.get(name))
+            response = prompt(name, "y" if was_set else "n", ["y", "n"], arg.get("help", ""))
+            if response.lower() in ("y", "yes"):
+                cmd_parts.append(name)
+        else:
+            value = prompt(name, str(default), arg.get("choices"), arg.get("help", ""))
+            if value:
+                cmd_parts.extend([name, value])
+
+    cmd_parts.extend(positionals)
+    cmd_str = " ".join(cmd_parts)
+
+    print(f"\n  {GREEN}→ {cmd_str}{RESET}\n")
+    confirm = prompt("run?", "y", ["y", "n"])
+    if confirm.lower() not in ("y", "yes", ""):
+        print("  cancelled")
+        return
+
+    # Log and execute
+    save_history(tool_name, cmd_str)
+    print()
+    os.execvp(cmd_parts[0].split()[0], cmd_parts[0].split() + cmd_parts[1:])
+
+
+if __name__ == "__main__":
+    main()
