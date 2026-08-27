@@ -7,15 +7,21 @@
 
 A daemon holds one headless (or headed) browser per named session; commands talk
 to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
-(id kind label cx cy w h state); actions answer with the change they caused, so
-"= N unchanged" alone means the action did nothing visible. Only elements in the
-viewport are clickable; scroll to reveal more. One-time setup beyond deps:
+(id kind label cx cy w h state); ids are stable for the life of the session, so
+a remembered id stays valid until the element leaves the page. Actions answer
+with the change they caused, so "= N unchanged" alone means the action did
+nothing visible; state flips (checkbox, tab, select) report themselves. `text`
+prints the page's readable text; snapshots list only interactive elements and
+headings. Only elements in the viewport are clickable; scroll to reveal more.
+New tabs are followed automatically. One-time setup beyond deps:
 playwright install chromium.
 """
 import argparse
+import collections
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -25,14 +31,16 @@ STATE = pathlib.Path.home() / ".tools" / "ui"
 W, H = 375, 812
 SCREENSHOT_TOKENS = 1624  # 750x1624 @2x via the ~(w*h)/750 vision formula
 TOL = 3  # px of coordinate jitter that still counts as unchanged
+PICKER = {"time", "date", "datetime-local", "month", "week"}  # native picker overlay eats all input
+TEXT_CAP = 6000  # chars of readable text per `text` call
 
 EXTRACT = r"""(() => {
-  const seen = new Set();
-  const lines = ['ts\tsource\tid\tkind\tlabel\tcx\tcy\tw\th\tstate'];
-  const ts = Math.floor(Date.now() / 1000);
-  let n = 0;
+  const seen = new Set(), rows = [];
   const sx = window.scrollX, sy = window.scrollY;
-  for (const el of document.querySelectorAll('a, button, input, select, textarea, [role="button"], h1, h2, h3, img, [onclick]')) {
+  const sel = 'a, button, input, select, textarea, summary, h1, h2, h3, img, [onclick], ' +
+    '[contenteditable="true"], [role="button"], [role="link"], [role="menuitem"], [role="tab"], ' +
+    '[role="checkbox"], [role="switch"], [role="textbox"], [role="option"]';
+  for (const el of document.querySelectorAll(sel)) {
     const r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) continue;
     if (!el.getClientRects().length) continue;
@@ -44,27 +52,82 @@ EXTRACT = r"""(() => {
       if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') { hidden = true; break; }
     }
     if (hidden) continue;
-    const tag = el.tagName.toLowerCase();
-    let kind = tag, state = '-';
-    let text = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 40);
-    if (tag === 'a') kind = 'link';
-    if (tag === 'button' || el.getAttribute('role') === 'button') kind = 'button';
+    const tag = el.tagName.toLowerCase(), role = el.getAttribute('role');
+    let kind = role || tag, state = '-';
+    let text = (el.innerText || el.getAttribute('aria-label') || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (tag === 'a') kind = role || 'link';
     if (/^h[1-3]$/.test(tag)) kind = 'heading';
+    if (el.isContentEditable) kind = 'textbox';
     if (tag === 'img') { kind = 'img'; text = (el.alt || '').slice(0, 40); if (!text) continue; }
+    const fieldName = (el2) => {
+      const lab = el2.closest('label') || (el2.id && document.querySelector('label[for="' + el2.id + '"]'));
+      return ((lab && lab.innerText) || el2.getAttribute('aria-label') || el2.placeholder || el2.name || '')
+        .trim().replace(/\s+/g, ' ').slice(0, 40);
+    };
+    if (tag === 'textarea') {
+      text = fieldName(el);
+      state = (el.value || '').trim().replace(/\s+/g, ' ').slice(0, 25) || '-';
+    }
+    if (el.isContentEditable) {
+      text = (el.getAttribute('aria-label') || el.getAttribute('data-placeholder') || 'editor').slice(0, 40);
+      state = (el.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 25) || '-';
+    }
+    if (tag === 'select') {
+      text = (el.name || el.getAttribute('aria-label') || '').slice(0, 40);
+      state = (el.selectedOptions[0]?.textContent || '').trim().slice(0, 25) || '-';
+    }
     if (tag === 'input') {
       kind = el.type || 'input';
-      text = (el.value || el.name || el.placeholder || '').slice(0, 40);
+      text = fieldName(el);
+      if (el.type === 'password') state = el.value ? '***' : '-';
+      else state = (el.value || '').trim().replace(/\s+/g, ' ').slice(0, 25) || '-';
       if (el.type === 'checkbox' || el.type === 'radio') state = el.checked ? 'on' : 'off';
     }
+    if (role === 'checkbox' || role === 'switch' || role === 'tab' || role === 'option')
+      state = (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true') ? 'on' : 'off';
     const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
-    const key = kind + '|' + cx + '|' + cy + '|' + text;
+    const key = cx + '|' + cy + '|' + text;  // nested same-label interactives collapse to one row
     if (seen.has(key)) continue;
     seen.add(key);
-    text = (text || '-').replace(/\t/g, ' ');
-    lines.push([ts, 'web', 'e' + (++n), kind, text, cx, cy, Math.round(r.width), Math.round(r.height), state].join('\t'));
+    rows.push([kind, (text || '-').replace(/\t/g, ' '), cx, cy, Math.round(r.width), Math.round(r.height), state]);
   }
-  return lines.join('\n');
+  return { rows, sy: Math.round(sy), sx: Math.round(sx), sh: document.documentElement.scrollHeight,
+           vw: window.innerWidth, vh: window.innerHeight };
 })()"""
+
+SELECT = r"""([x, y, opt]) => {
+  const el = document.elementFromPoint(x, y);
+  if (!el || el.tagName !== 'SELECT') return 'not a select element';
+  const opts = [...el.options];
+  const o = opts.find(o => o.textContent.trim().toLowerCase() === opt.toLowerCase())
+        || opts.find(o => o.textContent.trim().toLowerCase().includes(opt.toLowerCase()));
+  if (!o) {
+    let names = opts.map(o => o.textContent.trim());
+    if (names.length > 30) names = names.slice(0, 30).concat('… +' + (names.length - 30) + ' more');
+    return 'no option matching ' + JSON.stringify(opt) + '; options: ' + names.join(' | ');
+  }
+  el.value = o.value;
+  el.dispatchEvent(new Event('input', {bubbles: true}));
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+  return '';
+}"""
+
+SCROLL = r"""(dy) => {
+  const y0 = window.scrollY;
+  window.scrollBy(0, dy);
+  if (window.scrollY !== y0) return 'window';
+  let best = null;
+  for (const el of document.querySelectorAll('*')) {
+    if (el.scrollHeight > el.clientHeight + 100) {
+      const s = getComputedStyle(el);
+      if (/(auto|scroll|overlay)/.test(s.overflowY) && (!best || el.clientHeight > best.clientHeight)) best = el;
+    }
+  }
+  if (best) { const t0 = best.scrollTop; best.scrollBy(0, dy); if (best.scrollTop !== t0) return 'pane'; }
+  return '';
+}"""
+
+TEXT = r"""(document.querySelector('main, article, [role="main"]') || document.body).innerText"""
 
 RIPPLE = """
 addEventListener('mousedown', e => {
@@ -78,15 +141,58 @@ addEventListener('mousedown', e => {
 """
 
 
-# ---------- TSV diff ----------
+# ---------- snapshot & diff ----------
 
-def parse(text):
-    rows = []
-    for line in text.rstrip("\n").split("\n")[1:]:
-        f = line.split("\t")
-        rows.append({"id": f[2], "kind": f[3], "label": f[4], "cx": int(f[5]), "cy": int(f[6]),
-                     "w": f[7], "h": f[8], "state": f[9]})
-    return rows
+def frames(page):
+    """Direct child frames of the main frame, with their page offsets."""
+    for fr in page.frames:
+        if fr is page.main_frame or fr.parent_frame is not page.main_frame:
+            continue
+        try:
+            box = fr.frame_element().bounding_box()
+        except Exception:
+            continue
+        if box and box["width"] >= 40 and box["height"] >= 40:
+            yield fr, box
+
+
+def extract(state):
+    """Full-page rows with session-stable ids; returns the viewport slice."""
+    page = state["page"]
+    data = page.evaluate(EXTRACT)
+    raw = list(data["rows"])
+    for fr, box in frames(page):
+        try:
+            sub = fr.evaluate(EXTRACT)
+        except Exception:
+            continue
+        ox, oy = box["x"] + data["sx"] - sub["sx"], box["y"] + data["sy"] - sub["sy"]
+        raw += [[k, l, round(cx + ox), round(cy + oy), w, h, s] for k, l, cx, cy, w, h, s in sub["rows"]]
+    rows = [{"kind": k, "label": l, "cx": cx, "cy": cy, "w": w, "h": h, "state": s}
+            for k, l, cx, cy, w, h, s in raw]
+    pool = collections.defaultdict(list)
+    for r in state["all"]:
+        pool[(r["kind"], r["label"])].append(r)
+    for r in rows:
+        cands = pool.get((r["kind"], r["label"]))
+        if cands:
+            c = min(cands, key=lambda o: (o["cx"] - r["cx"]) ** 2 + (o["cy"] - r["cy"]) ** 2)
+            cands.remove(c)
+            r["id"] = c["id"]
+        else:
+            state["n"] += 1
+            r["id"] = f"e{state['n']}"
+    state["all"] = rows
+    state["sy"], state["sh"] = data["sy"], data["sh"]
+    state["vw"], state["vh"] = data["vw"], data["vh"]  # CSS viewport; 980-ish when a page has no meta viewport
+    return [r for r in rows if data["sy"] - 40 <= r["cy"] <= data["sy"] + data["vh"] + 40
+            and data["sx"] - 40 <= r["cx"] <= data["sx"] + data["vw"] + 40]
+
+
+def ser(rows):
+    head = "id\tkind\tlabel\tcx\tcy\tw\th\tstate"
+    return "\n".join([head] + ["\t".join(str(r[k]) for k in ("id", "kind", "label", "cx", "cy", "w", "h", "state"))
+                              for r in rows])
 
 
 def fmt(r, coords=True):
@@ -99,29 +205,26 @@ def fmt(r, coords=True):
 
 
 def diff(old, new):
-    import collections
-    pool = collections.defaultdict(list)
-    for r in old:
-        pool[(r["kind"], r["label"])].append(r)
-    unchanged, moved, added = 0, [], []
+    by_id = {r["id"]: r for r in old}
+    unchanged, flipped, added = 0, [], []
+    shifts = collections.defaultdict(list)
     for r in new:
-        cands = pool.get((r["kind"], r["label"]))
-        if cands:
-            c = min(cands, key=lambda o: (o["cx"] - r["cx"]) ** 2 + (o["cy"] - r["cy"]) ** 2)
-            cands.remove(c)
-            dx, dy = r["cx"] - c["cx"], r["cy"] - c["cy"]
-            if abs(dx) <= TOL and abs(dy) <= TOL:
-                unchanged += 1
-            else:
-                moved.append((r, dx, dy))
-        else:
+        o = by_id.pop(r["id"], None)
+        if o is None:
             added.append(r)
-    removed = [r for rs in pool.values() for r in rs]
+            continue
+        dx, dy = r["cx"] - o["cx"], r["cy"] - o["cy"]
+        if abs(dx) > TOL or abs(dy) > TOL:
+            shifts[(dx, dy)].append(r)
+        elif r["state"] != o["state"]:
+            flipped.append(r)
+        else:
+            unchanged += 1
+    removed = list(by_id.values())
 
     out = [f"= {unchanged} unchanged"]
-    shifts = collections.defaultdict(list)
-    for r, dx, dy in moved:
-        shifts[(dx, dy)].append(r)
+    for r in flipped:
+        out.append("~ " + fmt(r, coords=False))
     for (dx, dy), rs in sorted(shifts.items(), key=lambda kv: -len(kv[1])):
         if len(rs) >= 3:
             out.append(f"~ {len(rs)} rows shifted ({dx:+},{dy:+})")
@@ -130,7 +233,7 @@ def diff(old, new):
                 out.append(f"~ {r['id']} {r['kind']} \"{r['label']}\" ->{r['cx']},{r['cy']} ({dx:+},{dy:+})")
     for r in added:
         out.append("+ " + fmt(r))
-    if len(removed) > 10 and len(removed) * 3 > len(old):  # mass removal: page replaced
+    if len(removed) > 10 and len(removed) * 3 > len(old):
         out.append(f"- {len(removed)} rows removed")
     else:
         for r in removed:
@@ -150,7 +253,7 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
     srv.listen(1)
     ledger = []
     with sync_playwright() as pl:
-        ctx_opts = {"viewport": {"width": W, "height": H}}
+        ctx_opts = {"viewport": {"width": W, "height": H}, "is_mobile": True}  # honor meta viewport
         if video:
             (STATE / "video").mkdir(parents=True, exist_ok=True)
             ctx_opts.update(record_video_dir=str(STATE / "video"), record_video_size={"width": W, "height": H})
@@ -162,11 +265,21 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             ctx = browser.new_context(**ctx_opts)
         if headed or video:
             ctx.add_init_script(RIPPLE)
+        dialogs = []
+
+        def arm(p):
+            p.on("dialog", lambda d: (dialogs.append(f"{d.type}: {d.message}"), d.accept()))
+
+        for p in ctx.pages:  # persistent context: initial page predates the listener
+            arm(p)
+        ctx.on("page", arm)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(url, wait_until="load")
         page.wait_for_timeout(1500)
 
-        state = {"last": snapshot(page)}
+        state = {"page": page, "all": [], "n": 0, "sy": 0, "sh": 0, "url": page.url, "dialogs": dialogs,
+                 "w": W, "h": H}
+        state["last"] = extract(state)
         print("ready", flush=True)
         while True:
             conn, _ = srv.accept()
@@ -174,13 +287,14 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             req = json.loads(f.readline())
             t0 = time.time()
             try:
-                out = handle(page, state, req)
+                out = handle(state, req)
             except Exception as e:
                 out = {"error": f"{type(e).__name__}: {e}"}
             out["ms"] = int((time.time() - t0) * 1000)
             if req["op"] not in ("ping", "stop", "ledger") and "error" not in out:
+                sent = out.get("diff") or out.get("tsv") or out.get("text") or ""
                 ledger.append({"op": req.get("label", req["op"]), "ms": out["ms"],
-                               "sent": len(out.get("diff", out.get("tsv", ""))), "tree": tree_bytes(page)})
+                               "sent": len(sent), "tree": tree_bytes(state["page"])})
             if req["op"] == "ledger":
                 out["rows"] = ledger
             f.write(json.dumps(out).encode() + b"\n")
@@ -188,25 +302,13 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             conn.close()
             if req["op"] == "stop":
                 break
-        vid = page.video if video else None
+        vid = state["page"].video if video else None
         ctx.close()
         if vid:
             print(f"video: {vid.path()}", flush=True)
         if not profile_dir:
             browser.close()
     os.unlink(sock)
-
-
-def snapshot(page):
-    tsv = page.evaluate(EXTRACT)
-    sy = page.evaluate("window.scrollY")
-    lines = tsv.split("\n")
-    keep = [lines[0]]
-    for line in lines[1:]:
-        f = line.split("\t")
-        if sy - 40 <= int(f[6]) <= sy + H + 40:
-            keep.append(line)
-    return "\n".join(keep)
 
 
 def tree_bytes(page):
@@ -224,8 +326,24 @@ def settle(page):
     page.wait_for_timeout(600)
 
 
-def resolve(last, target, index):
-    rows = parse(last)
+def current_page(state):
+    """Follow new tabs and survive closed ones; returns True if the page changed."""
+    pages = [p for p in state["page"].context.pages if not p.is_closed()]
+    if not pages:
+        raise RuntimeError("all pages closed")
+    if state["page"].is_closed() or pages[-1] is not state["page"]:
+        state["page"] = pages[-1]
+        try:
+            state["page"].set_viewport_size({"width": state["w"], "height": state["h"]})
+            state["page"].wait_for_load_state("load", timeout=5000)
+            state["page"].bring_to_front()
+        except Exception:
+            pass
+        return True
+    return False
+
+
+def resolve(rows, target, index):
     if target.startswith("e") and target[1:].isdigit():
         hits = [r for r in rows if r["id"] == target]
     else:
@@ -234,48 +352,161 @@ def resolve(last, target, index):
         if not hits:
             hits = [r for r in rows if t in r["label"].casefold()]
     if not hits:
-        raise ValueError(f"no element matching {target!r}")
+        raise ValueError(f"no element matching {target!r} — run read for a fresh snapshot")
     if len(hits) > 1 and not index:
         opts = "; ".join(f"{r['id']}:{r['label'][:25]}@{r['cx']},{r['cy']}" for r in hits[:6])
         raise ValueError(f"{len(hits)} matches for {target!r}: {opts} — pass an index or id")
     return hits[(index or 1) - 1]
 
 
-def act_result(page, state):
-    new = snapshot(page)
-    d = diff(parse(state["last"]), parse(new))
+def pos(state):
+    vh = state.get("vh") or state["h"]
+    if state["sh"] <= vh + 50:
+        return None
+    s = f"y {state['sy']}-{min(state['sy'] + vh, state['sh'])} of {state['sh']}"
+    above = sum(1 for r in state["all"] if r["cy"] < state["sy"] - 40)
+    below = sum(1 for r in state["all"] if r["cy"] > state["sy"] + vh + 40)
+    if above:
+        s += f"; {above} elems above"
+    if below:
+        s += f"; {below} elems below"
+    return s
+
+
+def locate(state, target, index):
+    """Resolve in the viewport, else scroll an off-viewport match into view."""
+    try:
+        return resolve(state["last"], target, index), None
+    except ValueError:
+        r = resolve(state["all"], target, index)
+        state["page"].evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
+        state["page"].wait_for_timeout(300)
+        state["last"] = extract(state)
+        return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
+
+
+def act_result(state, note=None):
+    switched = current_page(state)
+    new = extract(state)
+    out = {"diff": diff(state["last"], new)}
     state["last"] = new
-    return {"diff": d, "url": page.url}
+    notes = ([note] if note else []) + (["switched to new tab"] if switched else []) \
+        + [f"dialog {d} (accepted)" for d in state["dialogs"]]
+    state["dialogs"].clear()
+    if notes:
+        out["note"] = "; ".join(notes)
+    if state["page"].url != state["url"]:
+        out["url"] = state["url"] = state["page"].url
+    return out
 
 
-def handle(page, state, req):
+def click_at(state, r):
+    page = state["page"]
+    if r["kind"] in ("file", "color"):
+        raise ValueError(f"{r['kind']} inputs open a native dialog; not supported")
+    if r["kind"] == "select":
+        raise ValueError(f"use select {r['id']} OPTION to choose from a dropdown")
+    x, y = r["cx"], r["cy"] - page.evaluate("window.scrollY")
+    if r["kind"] in PICKER:
+        page.evaluate(f"document.elementFromPoint({x},{y})?.focus()")
+    else:
+        page.mouse.click(x, y)
+
+
+def handle(state, req):
     op = req["op"]
     if op in ("ping", "stop", "ledger"):
         return {"ok": op}
+    current_page(state)
+    page = state["page"]
     if op == "read":
-        state["last"] = snapshot(page)
-        return {"tsv": state["last"], "url": page.url}
-    if op == "click":
-        r = resolve(state["last"], req["target"], req.get("index"))
-        page.mouse.click(r["cx"], r["cy"] - page.evaluate("window.scrollY"))
+        state["last"] = extract(state)
+        return {k: v for k, v in
+                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
+    if op == "text":
+        txt = page.evaluate(TEXT)
+        for fr, _ in frames(page):
+            try:
+                txt += "\n" + fr.evaluate(TEXT)
+            except Exception:
+                pass
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        off = req.get("offset") or 0
+        chunk = txt[off:off + TEXT_CAP]
+        more = len(txt) - off - TEXT_CAP
+        if more > 0:
+            chunk += f"\n…(+{more} more chars — pass offset {off + TEXT_CAP} to continue)"
+        return {"text": chunk, "url": page.url}
+    if op == "open":
+        page.goto(req["url"], wait_until="load")
         settle(page)
-        return act_result(page, state)
+        state["last"] = extract(state)
+        state["url"] = page.url
+        return {k: v for k, v in
+                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
+    if op == "click":
+        r, note = locate(state, req["target"], req.get("index"))
+        click_at(state, r)
+        settle(page)
+        out = act_result(state, note)
+        if "\n" not in out["diff"] and "url" not in out and "note" not in out:
+            out["diff"] += "\n(no visible change)"
+        return out
+    if op == "select":
+        r, note = locate(state, req["target"], req.get("index"))
+        err = page.evaluate(SELECT, [r["cx"], r["cy"] - page.evaluate("window.scrollY"), req["option"]])
+        if err:
+            raise ValueError(err)
+        settle(page)
+        return act_result(state, note)
     if op == "type":
+        note = None
+        if req.get("into"):
+            r, note = locate(state, req["into"], req.get("index"))
+            click_at(state, r)
+            page.wait_for_timeout(150)
         page.keyboard.type(req["text"], delay=25)
         page.wait_for_timeout(700)
-        return act_result(page, state)
+        return act_result(state, note)
+    if op == "hover":
+        r, note = locate(state, req["target"], req.get("index"))
+        page.mouse.move(r["cx"], r["cy"] - page.evaluate("window.scrollY"))
+        page.wait_for_timeout(500)
+        return act_result(state, note)
     if op == "press":
         page.keyboard.press(req["key"])
         settle(page)
-        return act_result(page, state)
+        return act_result(state)
     if op == "goto":
         page.goto(req["url"], wait_until="load")
         settle(page)
-        return act_result(page, state)
+        return act_result(state)
+    if op == "back":
+        page.go_back(wait_until="load")
+        settle(page)
+        return act_result(state)
+    if op == "eval":  # internal: debugging escape hatch
+        return {"text": json.dumps(page.evaluate(req["js"]))[:2000]}
+    if op == "resize":
+        state["w"], state["h"] = (1280, 900) if req["preset"] == "desktop" else (W, H)
+        page.set_viewport_size({"width": state["w"], "height": state["h"]})
+        settle(page)
+        state["last"] = extract(state)
+        return {k: v for k, v in
+                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
+    if op == "wait":
+        page.wait_for_timeout(min(float(req.get("secs") or 2), 10) * 1000)
+        return act_result(state)
     if op == "scroll":
-        page.mouse.wheel(0, int(req["dy"]))
+        # scrollBy, not mouse.wheel: wheel events are ignored under touch emulation
+        moved = page.evaluate(SCROLL, int(req["dy"]))
         page.wait_for_timeout(500)
-        return act_result(page, state)
+        out = act_result(state, "scrolled inner pane" if moved == "pane" else None)
+        if not moved:
+            out["diff"] += "\n(nothing scrolled — page and panes fit their viewports; resize desktop may help)"
+        if pos(state):
+            out["pos"] = pos(state)
+        return out
     return {"error": f"unknown op {op}"}
 
 
@@ -307,7 +538,7 @@ def alive(sock):
 
 def ensure_session(name, sock, url, flags):
     if alive(sock):
-        return call(sock, {"op": "goto", "url": url, "label": "open"})
+        return call(sock, {"op": "open", "url": url, "label": "open"})
     STATE.mkdir(parents=True, exist_ok=True)
     log = open(STATE / f"session-{name}.log", "w")
     subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), "-s", name, "daemon", url, *flags],
@@ -320,7 +551,18 @@ def ensure_session(name, sock, url, flags):
     sys.exit(1)
 
 
-def emit(resp, out):
+def emit(resp):
+    parts = []
+    if resp.get("note"):
+        parts.append("» " + resp["note"])
+    if resp.get("url"):
+        parts.append("@ " + resp["url"])
+    body = resp.get("tsv") or resp.get("diff") or resp.get("text") or resp.get("ok", "")
+    if body:
+        parts.append(body)
+    if resp.get("pos"):
+        parts.append(resp["pos"])
+    out = "\n".join(parts)
     print(out)
     print(f"[{len(out)}B {resp['ms']}ms]", file=sys.stderr)
 
@@ -335,18 +577,34 @@ def main():
     sp.add_argument("--video", action="store_true", help="record a webm into ~/.tools/ui/video/")
     sp.add_argument("--profile", action="store_true", help="persistent profile for this session name: log in once (headed), stay logged in")
     sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
+    sp = sub.add_parser("text", help="readable page text (main content), capped per call")
+    sp.add_argument("offset", nargs="?", type=int, default=0, help="character offset to continue from")
     sp = sub.add_parser("click", help="click an element; returns the diff it caused")
     sp.add_argument("target", help="element id (e12) or label text")
     sp.add_argument("index", nargs="?", type=int, help="pick among multiple label matches (1-based)")
     sp = sub.add_parser("type", help="type into the focused element; returns the diff")
     sp.add_argument("text", help="text to type")
+    sp.add_argument("--into", help="element (id or label) to click first")
+    sp = sub.add_parser("select", help="choose a dropdown option by its visible text; returns the diff")
+    sp.add_argument("target", help="select element (id or label)")
+    sp.add_argument("option", help="option text to choose")
+    sp = sub.add_parser("hover", help="hover an element (reveals hover menus); returns the diff")
+    sp.add_argument("target", help="element id (e12) or label text")
+    sp.add_argument("index", nargs="?", type=int, help="pick among multiple label matches (1-based)")
     sp = sub.add_parser("press", help="press a key (Enter, Tab, Escape); returns the diff")
     sp.add_argument("key", help="key name")
     sp = sub.add_parser("goto", help="navigate the session; returns the diff")
     sp.add_argument("url", help="destination URL")
+    sub.add_parser("back", help="go back in history; returns the diff")
     sp = sub.add_parser("scroll", help="scroll vertically; returns the diff")
     sp.add_argument("dy", type=int, help="pixels down (negative scrolls up)")
+    sp = sub.add_parser("resize", help="switch viewport; desktop reveals sidebars mobile layouts hide")
+    sp.add_argument("preset", choices=["desktop", "mobile"], help="1280x900 or 375x812")
+    sp = sub.add_parser("wait", help="wait for the page to change on its own; returns the diff")
+    sp.add_argument("secs", nargs="?", type=float, default=2, help="seconds to wait (max 10, default 2)")
     sub.add_parser("ledger", help="per-action cost vs accessibility-tree and screenshot baselines")
+    sp = sub.add_parser("eval", help=argparse.SUPPRESS)
+    sp.add_argument("js")
     sub.add_parser("ping", help="check whether the session is alive")
     sub.add_parser("stop", help="end the session")
     sp = sub.add_parser("daemon", help="(internal) run the session process")
@@ -364,8 +622,7 @@ def main():
         return
     if a.cmd == "open":
         flags = [f for f, on in [("--headed", a.headed), ("--video", a.video), ("--profile", a.profile)] if on]
-        resp = ensure_session(a.session, sock, a.url, flags)
-        emit(resp, resp.get("tsv") or resp.get("diff", ""))
+        emit(ensure_session(a.session, sock, a.url, flags))
         return
     if not alive(sock):
         print(f"no live session {a.session!r} — start one with: ui open URL", file=sys.stderr)
@@ -378,10 +635,26 @@ def main():
             req["index"] = a.index
     elif a.cmd == "type":
         req.update(text=a.text, label=f"type {a.text[:20]}")
+        if a.into:
+            req["into"] = a.into
+    elif a.cmd == "select":
+        req.update(target=a.target, option=a.option, label=f"select {a.option[:20]}")
+    elif a.cmd == "hover":
+        req.update(target=a.target, label=f"hover {a.target[:20]}")
+        if a.index:
+            req["index"] = a.index
     elif a.cmd == "press":
         req.update(key=a.key, label=f"press {a.key}")
     elif a.cmd == "goto":
         req.update(url=a.url, label="goto")
+    elif a.cmd == "text":
+        req.update(offset=a.offset, label="text")
+    elif a.cmd == "resize":
+        req.update(preset=a.preset, label=f"resize {a.preset}")
+    elif a.cmd == "wait":
+        req.update(secs=a.secs, label=f"wait {a.secs}")
+    elif a.cmd == "eval":
+        req["js"] = a.js
     elif a.cmd == "scroll":
         req.update(dy=a.dy, label=f"scroll {a.dy}")
     resp = call(sock, req)
@@ -389,7 +662,7 @@ def main():
         for r in resp["rows"]:
             print(f"{r['op']:<26}{r['ms']:>6}ms{r['sent']:>8}B sent   (tree {r['tree']}B, screenshot ~{SCREENSHOT_TOKENS}tok)")
     else:
-        emit(resp, resp.get("diff") or resp.get("tsv") or resp.get("ok", ""))
+        emit(resp)
 
 
 if __name__ == "__main__":
