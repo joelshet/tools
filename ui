@@ -127,6 +127,27 @@ SCROLL = r"""(dy) => {
   return '';
 }"""
 
+HTML = r"""([x, y, whole]) => {
+  let el = whole ? document.body : document.elementFromPoint(x, y);
+  if (!el) return '';
+  for (let i = 0; i < 3 && !whole && el.parentElement && el.parentElement !== document.body
+       && el.outerHTML.length < 400; i++) el = el.parentElement;
+  const KEEP = new Set(['href', 'src', 'alt', 'title', 'type', 'name', 'value', 'placeholder', 'role',
+    'id', 'for', 'action', 'method', 'colspan', 'rowspan', 'datetime', 'selected', 'checked', 'disabled',
+    'open', 'label']);
+  const clean = (n) => {
+    if (n.attributes) for (const a of [...n.attributes])
+      if (!KEEP.has(a.name) && !a.name.startsWith('aria-')) n.removeAttribute(a.name);
+    for (const c of [...n.children]) {
+      if (/^(script|style|noscript|template|svg|link|meta)$/i.test(c.tagName)) { c.remove(); continue; }
+      clean(c);
+    }
+  };
+  const clone = el.cloneNode(true);
+  clean(clone);
+  return clone.outerHTML;
+}"""
+
 TEXT = r"""(document.querySelector('main, article, [role="main"]') || document.body).innerText"""
 
 RIPPLE = """
@@ -359,6 +380,15 @@ def resolve(rows, target, index):
     return hits[(index or 1) - 1]
 
 
+def clip(txt, off):
+    txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+    chunk = txt[off:off + TEXT_CAP]
+    more = len(txt) - off - TEXT_CAP
+    if more > 0:
+        chunk += f"\n…(+{more} more chars — pass offset {off + TEXT_CAP} to continue)"
+    return chunk
+
+
 def pos(state):
     vh = state.get("vh") or state["h"]
     if state["sh"] <= vh + 50:
@@ -430,13 +460,14 @@ def handle(state, req):
                 txt += "\n" + fr.evaluate(TEXT)
             except Exception:
                 pass
-        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
-        off = req.get("offset") or 0
-        chunk = txt[off:off + TEXT_CAP]
-        more = len(txt) - off - TEXT_CAP
-        if more > 0:
-            chunk += f"\n…(+{more} more chars — pass offset {off + TEXT_CAP} to continue)"
-        return {"text": chunk, "url": page.url}
+        return {"text": clip(txt, req.get("offset") or 0), "url": page.url}
+    if op == "html":
+        if req.get("target"):
+            r, _ = locate(state, req["target"], req.get("index"))
+            raw = page.evaluate(HTML, [r["cx"], r["cy"] - page.evaluate("window.scrollY"), False])
+        else:
+            raw = page.evaluate(HTML, [0, 0, True])
+        return {"text": clip(raw, req.get("offset") or 0), "url": page.url}
     if op == "open":
         page.goto(req["url"], wait_until="load")
         settle(page)
@@ -579,6 +610,9 @@ def main():
     sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
     sp = sub.add_parser("text", help="readable page text (main content), capped per call")
     sp.add_argument("offset", nargs="?", type=int, default=0, help="character offset to continue from")
+    sp = sub.add_parser("html", help="cleaned HTML of the page or one element: structure and attributes the snapshot omits")
+    sp.add_argument("target", nargs="?", help="element id (e12) or label text; whole page if omitted")
+    sp.add_argument("--offset", type=int, default=0, help="character offset to continue from")
     sp = sub.add_parser("click", help="click an element; returns the diff it caused")
     sp.add_argument("target", help="element id (e12) or label text")
     sp.add_argument("index", nargs="?", type=int, help="pick among multiple label matches (1-based)")
@@ -649,6 +683,10 @@ def main():
         req.update(url=a.url, label="goto")
     elif a.cmd == "text":
         req.update(offset=a.offset, label="text")
+    elif a.cmd == "html":
+        req.update(offset=a.offset, label="html")
+        if a.target:
+            req["target"] = a.target
     elif a.cmd == "resize":
         req.update(preset=a.preset, label=f"resize {a.preset}")
     elif a.cmd == "wait":
