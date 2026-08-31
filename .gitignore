@@ -2,3 +2,7 @@ __pycache__/
 .DS_Store
 *.pyc
 vgrep/
+
+# machine-local symlinks, recreate per machine
+zed
+pi-curator
