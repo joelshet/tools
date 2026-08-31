@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Wait for the human to speak (V sign at the camera opens the mic), print the transcript.
+
+Exit codes: 0 transcript printed, 1 timeout, 2 bridge unreachable.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--timeout", type=float, default=300, help="seconds to wait (default 300)")
+parser.add_argument("--port", type=int, default=7737)
+args = parser.parse_args()
+
+# the phosphor-glass app this tool talks to (bridge.py + page live there)
+BRIDGE_DIR = os.path.expanduser("~/Documents/Claude/Projects/Research Experiments/phosphor-glass")
+
+
+def bridge_up():
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/health", timeout=1)
+        return True
+    except OSError:
+        return False
+
+
+if not bridge_up():
+    log = open(os.path.join(BRIDGE_DIR, "bridge.log"), "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.join(BRIDGE_DIR, "bridge.py")],
+        cwd=BRIDGE_DIR, start_new_session=True, stdout=log, stderr=log,
+        env={**os.environ, "PHOSPHOR_PORT": str(args.port)},
+    )
+    for _ in range(20):
+        time.sleep(0.25)
+        if bridge_up():
+            break
+    else:
+        print("could not start bridge.py", file=sys.stderr)
+        sys.exit(2)
+
+after = time.time()  # only utterances from now on
+deadline = after + args.timeout
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{args.port}/api/transcript?after={after}", timeout=35
+        ) as resp:
+            r = json.load(resp)
+    except (urllib.error.URLError, OSError):
+        time.sleep(1)
+        continue
+    if r.get("text"):
+        print(r["text"])
+        sys.exit(0)
+print("timeout: nothing heard", file=sys.stderr)
+sys.exit(1)

@@ -1,0 +1,94 @@
+#!/bin/sh
+# tabs — file-based Chrome tab groups. Groups are text files in ~/tabs,
+# one URL per line; lines starting with # are comments.
+#
+#   tabs            list groups
+#   tabs GROUP...   open each group's URLs as Chrome tabs
+#   tabs clear      close all Chrome tabs
+#   tabs save NAME  save currently open Chrome tabs as a new group
+
+set -eu
+
+TABS_DIR="$HOME/tabs"
+BROWSER="Google Chrome"
+
+list_groups() {
+    found=0
+    for f in "$TABS_DIR"/*.txt; do
+        [ -e "$f" ] || continue
+        found=1
+        name=$(basename "$f" .txt)
+        count=$(grep -cv -e '^#' -e '^[[:space:]]*$' "$f" || true)
+        printf '%s\t%s\n' "$name" "$count"
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "tabs: no groups in $TABS_DIR (add a .txt file with one URL per line)" >&2
+        exit 1
+    fi
+}
+
+open_group() {
+    f="$TABS_DIR/$1.txt"
+    if [ ! -f "$f" ]; then
+        echo "tabs: no group '$1' in $TABS_DIR" >&2
+        exit 1
+    fi
+    urls=$(grep -v -e '^#' -e '^[[:space:]]*$' "$f" || true)
+    if [ -z "$urls" ]; then
+        echo "tabs: group '$1' has no URLs" >&2
+        exit 1
+    fi
+    echo "$urls" | xargs open -a "$BROWSER"
+}
+
+clear_tabs() {
+    pgrep -xq "$BROWSER" || exit 0
+    osascript -e "tell application \"$BROWSER\" to close every window" >/dev/null
+}
+
+save_group() {
+    name="${1:-}"
+    if [ -z "$name" ]; then
+        echo "tabs: save needs a group name" >&2
+        exit 1
+    fi
+    f="$TABS_DIR/$name.txt"
+    if [ -e "$f" ]; then
+        echo "tabs: group '$name' already exists; pick another name or delete $f first" >&2
+        exit 1
+    fi
+    if ! pgrep -xq "$BROWSER"; then
+        echo "tabs: $BROWSER is not running" >&2
+        exit 1
+    fi
+    urls=$(
+        osascript <<OSA | grep -E '^https?://' || true
+set out to ""
+tell application "$BROWSER"
+    repeat with w in every window
+        repeat with t in every tab of w
+            set out to out & (URL of t) & linefeed
+        end repeat
+    end repeat
+end tell
+out
+OSA
+    )
+    if [ -z "$urls" ]; then
+        echo "tabs: no http(s) tabs open to save" >&2
+        exit 1
+    fi
+    {
+        echo "# saved $(date '+%Y-%m-%d %H:%M')"
+        printf '%s\n' "$urls"
+    } > "$f"
+    echo "saved $(printf '%s\n' "$urls" | wc -l | tr -d ' ') tabs to $f"
+}
+
+case "${1:-}" in
+    "") list_groups ;;
+    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
+    clear) clear_tabs ;;
+    save) save_group "${2:-}" ;;
+    *) for group in "$@"; do open_group "$group"; done ;;
+esac

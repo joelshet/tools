@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Push text for HAL to speak aloud via Kokoro on the phosphor bridge.
+
+Default queues silently; the thumb+index+pinky hand sign plays the latest.
+--now speaks immediately without waiting for the sign.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("text")
+parser.add_argument("--now", action="store_true", help="speak immediately")
+parser.add_argument("--port", type=int, default=7737)
+args = parser.parse_args()
+
+# the phosphor-glass app this tool talks to (bridge.py + page live there)
+BRIDGE_DIR = os.path.expanduser("~/Documents/Claude/Projects/Research Experiments/phosphor-glass")
+
+
+def bridge_up():
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/health", timeout=1)
+        return True
+    except OSError:
+        return False
+
+
+if not bridge_up():
+    log = open(os.path.join(BRIDGE_DIR, "bridge.log"), "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.join(BRIDGE_DIR, "bridge.py")],
+        cwd=BRIDGE_DIR, start_new_session=True, stdout=log, stderr=log,
+        env={**os.environ, "PHOSPHOR_PORT": str(args.port)},
+    )
+    for _ in range(20):
+        time.sleep(0.25)
+        if bridge_up():
+            break
+    else:
+        print("could not start bridge.py", file=sys.stderr)
+        sys.exit(2)
+
+req = urllib.request.Request(
+    f"http://127.0.0.1:{args.port}/api/say",
+    json.dumps({"text": args.text, "now": args.now}).encode(),
+    {"Content-Type": "application/json"},
+)
+try:
+    urllib.request.urlopen(req, timeout=10)
+except (urllib.error.URLError, OSError) as e:
+    print(f"bridge error: {e}", file=sys.stderr)
+    sys.exit(2)

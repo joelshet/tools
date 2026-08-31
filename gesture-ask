@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Ask the human a question; they answer with a hand sign via the phosphor page.
+
+Prints the answer to stdout: yes, no, cancel, or 1-5.
+Exit codes: 0 answered, 1 timeout, 2 bridge unreachable.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("question")
+parser.add_argument("--timeout", type=float, default=120, help="seconds to wait (default 120)")
+parser.add_argument("--answers", help="comma-separated valid answers (e.g. yes,no or 1,2,3); other poses are ignored")
+parser.add_argument("--quiet", action="store_true", help="don't speak the question aloud")
+parser.add_argument("--port", type=int, default=7737)
+args = parser.parse_args()
+
+# the phosphor-glass app this tool talks to (bridge.py + page live there)
+BRIDGE_DIR = os.path.expanduser("~/Documents/Claude/Projects/Research Experiments/phosphor-glass")
+
+
+def bridge_up():
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{args.port}/api/health", timeout=1)
+        return True
+    except OSError:
+        return False
+
+
+if not bridge_up():
+    log = open(os.path.join(BRIDGE_DIR, "bridge.log"), "ab")
+    subprocess.Popen(
+        [sys.executable, os.path.join(BRIDGE_DIR, "bridge.py")],
+        cwd=BRIDGE_DIR, start_new_session=True,
+        stdout=log, stderr=log,
+        env={**os.environ, "PHOSPHOR_PORT": str(args.port)},
+    )
+    for _ in range(20):
+        time.sleep(0.25)
+        if bridge_up():
+            break
+    else:
+        print("could not start bridge.py", file=sys.stderr)
+        sys.exit(2)
+
+payload = {"question": args.question, "timeout": args.timeout, "speak": not args.quiet}
+if args.answers:
+    payload["answers"] = [a.strip() for a in args.answers.split(",") if a.strip()]
+req = urllib.request.Request(
+    f"http://127.0.0.1:{args.port}/api/ask",
+    json.dumps(payload).encode(),
+    {"Content-Type": "application/json"},
+)
+try:
+    with urllib.request.urlopen(req, timeout=args.timeout + 15) as resp:
+        print(json.load(resp)["answer"])
+except urllib.error.HTTPError as e:
+    if e.code == 408:
+        print("timeout: no hand-sign answer", file=sys.stderr)
+        sys.exit(1)
+    print(f"bridge error: {e}", file=sys.stderr)
+    sys.exit(2)
+except (urllib.error.URLError, OSError) as e:
+    print(f"bridge unreachable on port {args.port} (run bridge.py first): {e}", file=sys.stderr)
+    sys.exit(2)
