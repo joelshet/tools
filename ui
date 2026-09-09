@@ -230,6 +230,21 @@ OBSCURED = r"""([x, y, w, h]) => {
   return true;
 }"""
 
+REVEAL = r"""(t) => {
+  t = t.toLowerCase();
+  const sel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [role="radio"], [role="checkbox"]';
+  let el = null;
+  for (const e of document.querySelectorAll(sel)) {
+    const txt = (e.innerText || e.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    if (!txt) continue;
+    if (txt === t) { el = e; break; }
+    if (!el && txt.includes(t)) el = e;
+  }
+  if (!el) return false;
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  return true;
+}"""
+
 FOCUSED = r"""() => {
   const a = document.activeElement;
   if (!a || a === document.body) return false;
@@ -511,6 +526,8 @@ def current_page(state):
 
 
 def resolve(rows, target, index):
+    if target.isdigit():
+        raise ValueError(f"{target!r} is not an element: use an id like e12 or the label text")
     if target.startswith("e") and target[1:].isdigit():
         hits = [r for r in rows if r["id"] == target]
     else:
@@ -574,7 +591,15 @@ def locate(state, target, index):
             try:
                 return resolve(state["last"], target, index), None
             except ValueError:
-                r = resolve(state["all"], target, index)
+                try:
+                    r = resolve(state["all"], target, index)
+                except ValueError:
+                    # not in any snapshot: maybe clipped by a horizontal scroller or a virtual list
+                    if not state["page"].evaluate(REVEAL, target):
+                        raise
+                    state["page"].wait_for_timeout(300)
+                    state["last"] = extract(state)
+                    return resolve(state["last"], target, index), f"scrolled {target!r} into view"
         state["page"].evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
         state["page"].wait_for_timeout(300)
         state["last"] = extract(state)
