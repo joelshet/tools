@@ -11,7 +11,8 @@ to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
 a remembered id stays valid until the element leaves the page. Actions answer
 with the change they caused, so "= N unchanged" alone means the action did
 nothing visible; state flips (checkbox, radio, tab, select) report themselves,
-and toasts (role=status/alert, aria-live) appear as `status` rows. `text`
+and toasts (role=status/alert, aria-live) appear as `status` rows. A `pinned`
+state marks fixed or sticky elements that stay on screen while scrolling. `text`
 prints the page's readable text; snapshots list only interactive elements and
 headings. Labels are visible text (screen-reader-only spans dropped), or the
 aria-label when it says more. Off-viewport targets are scrolled into view
@@ -129,6 +130,13 @@ EXTRACT = r"""(() => {
     }
     if (role === 'checkbox' || role === 'switch' || role === 'tab' || role === 'option' || role === 'radio' || role === 'menuitemradio')
       state = (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true') ? 'on' : 'off';
+    // fixed or sticky (itself or a near ancestor): stays on screen, so no scrolling is needed to reach it
+    let pinned = false;
+    for (let p = el, i = 0; p && p !== document.body && i < 6; p = p.parentElement, i++) {
+      const ps = getComputedStyle(p).position;
+      if (ps === 'fixed' || ps === 'sticky') { pinned = true; break; }
+    }
+    if (pinned) state = state === '-' ? 'pinned' : state + ' pinned';
     const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
     const key = cx + '|' + cy + '|' + text;  // nested same-label interactives collapse to one row
     if (seen.has(key)) continue;
