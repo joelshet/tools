@@ -140,7 +140,7 @@ EXTRACT = MODAL_JS + r"""(() => {
     if (tag === 'img') { kind = 'img'; text = (el.alt || '').slice(0, 40); if (!text) continue; }
     const fieldName = (el2) => {
       const lab = el2.closest('label') || (el2.id && document.querySelector('label[for="' + el2.id + '"]'));
-      return ((lab && lab.innerText) || el2.getAttribute('aria-label') || el2.placeholder || el2.name || '')
+      return ((lab && vis(lab)) || el2.getAttribute('aria-label') || el2.placeholder || el2.name || '')
         .trim().replace(/\s+/g, ' ').slice(0, 40);
     };
     if (tag === 'textarea') {
@@ -1099,6 +1099,11 @@ def main():
     else:
         req = build_req(p, a)
     resp = call(sock, req)
+    if a.cmd == "stop":
+        for _ in range(40):
+            if not alive(sock):
+                break
+            time.sleep(0.25)
     if a.cmd == "ledger":
         for r in resp["rows"]:
             print(f"{r['op']:<26}{r['ms']:>6}ms{r['sent']:>8}B sent   (tree {r['tree']}B, screenshot ~{SCREENSHOT_TOKENS}tok)")
