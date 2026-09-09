@@ -14,16 +14,17 @@ nothing visible; state flips (checkbox, radio, tab, select) report themselves,
 and toasts (role=status/alert, aria-live) appear as `status` rows. A `pinned`
 state marks fixed or sticky elements that stay on screen while scrolling. `text`
 prints the page's readable text; snapshots list only interactive elements and
-headings. Labels are visible text (screen-reader-only spans dropped), or the
-aria-label when it says more. Off-viewport targets are scrolled into view
-before a click; targets under a sticky header are re-centered first. `scroll DY
-TARGET` scrolls the pane holding TARGET (drawers, virtual lists) instead of the
-page. `wait --for TEXT` returns as soon as TEXT shows up. `open` with a flag the
-live session lacks (--headed, --video, --profile) restarts that session.
-New tabs are followed automatically. A session is shared by name: two drivers on
-`default` will trample each other, so parallel agents each take `-s NAME`.
-One-time setup beyond deps:
-playwright install chromium.
+headings. `read` shows the viewport and `read --all` the whole page; `click`
+accepts any label on the page and scrolls off-screen targets into view, so
+scrolling is for looking, never for reaching. Labels are visible text (screen-
+reader-only spans dropped), or the aria-label when it says more. Targets under a
+sticky header are re-centered first. `scroll DY TARGET` scrolls the pane holding
+TARGET (drawers, virtual lists) instead of the page. `wait --for TEXT` returns
+as soon as TEXT shows up. `open` with a flag the live session lacks (--headed,
+--video, --profile) restarts that session. New tabs are followed automatically.
+A session is shared by name: two drivers on `default` will trample each other,
+so parallel agents each take `-s NAME`. One-time setup beyond deps: playwright
+install chromium.
 """
 import argparse
 import collections
@@ -576,6 +577,8 @@ def pos(state):
         s += f"; {above} elems above"
     if below:
         s += f"; {below} elems below"
+    if above or below:
+        s += " (read --all lists the whole page; click reaches any label on it)"
     return s + ("\n" + modal if modal else "")
 
 
@@ -665,8 +668,10 @@ def handle(state, req):
     page = state["page"]
     if op == "read":
         state["last"] = extract(state)
+        rows = state["all"] if req.get("all") else state["last"]
         return {k: v for k, v in
-                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state), "note": bot_check(state)}.items() if v}
+                {"tsv": ser(rows), "url": page.url, "pos": None if req.get("all") else pos(state),
+                 "note": bot_check(state)}.items() if v}
     if op == "text":
         txt = page.evaluate(TEXT)
         for fr, _ in frames(page):
@@ -866,7 +871,8 @@ def main():
     sp.add_argument("--headed", action="store_true", default=argparse.SUPPRESS, help="show the browser window (also passes bot checks that block headless)")
     sp.add_argument("--video", action="store_true", default=argparse.SUPPRESS, help="record a webm into ~/.tools/ui/video/")
     sp.add_argument("--profile", action="store_true", default=argparse.SUPPRESS, help="persistent profile for this session name: log in once (headed), stay logged in")
-    sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
+    sp = sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
+    sp.add_argument("--all", action="store_true", help="every element on the page, not just the viewport: survey once, then click by label")
     sp = sub.add_parser("text", help="readable page text (main content), capped per call")
     sp.add_argument("offset", nargs="?", type=int, default=0, help="character offset to continue from")
     sp = sub.add_parser("html", help="cleaned HTML of the page or one element: structure and attributes the snapshot omits")
@@ -924,6 +930,8 @@ def main():
         sys.exit(1)
 
     req = {"op": a.cmd}
+    if a.cmd == "read" and a.all:
+        req.update(all=True, label="read --all")
     if a.cmd == "click":
         req.update(target=a.target, label=f"click {a.target[:20]}")
         if a.index:
