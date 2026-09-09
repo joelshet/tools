@@ -63,8 +63,12 @@ EXTRACT = MODAL_JS + r"""(() => {
   const sx = window.scrollX, sy = window.scrollY;
   // an open modal owns the page: list only what is inside the topmost one
   const modal = findModal();
-  const modalName = modal ? ((modal.getAttribute('aria-label') || modal.querySelector('h1,h2,h3')?.innerText || 'dialog')
-    .trim().replace(/\s+/g, ' ').slice(0, 40)) : '';
+  let modalName = '';
+  if (modal) {
+    const al = (modal.getAttribute('aria-label') || '').trim();
+    const h = (modal.querySelector('h1,h2,h3')?.innerText || '').trim();
+    modalName = ((/^(dialog|modal|popup)$/i.test(al) ? h : al) || h || 'dialog').replace(/\s+/g, ' ').slice(0, 40);
+  }
   const sel = 'a, button, input, select, textarea, summary, h1, h2, h3, img, [onclick], ' +
     '[contenteditable="true"], [role="button"], [role="link"], [role="menuitem"], [role="tab"], ' +
     '[role="checkbox"], [role="switch"], [role="textbox"], [role="option"], [role="radio"], ' +
@@ -664,6 +668,8 @@ def handle(state, req):
         r, note = locate(state, req["target"], req.get("index"))
         click_at(state, r)
         settle(page)
+        if r["kind"] in FIELDS and page.evaluate(FOCUSED):
+            note = "; ".join(filter(None, [note, f"focused {r['id']}: type to fill it"]))
         out = act_result(state, note)
         for _ in range(8):  # drawers and dialogs that animate or fetch land after settle(): keep looking, up to ~3s
             if "\n" in out["diff"] or "url" in out or "note" in out:
