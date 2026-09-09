@@ -106,8 +106,9 @@ EXTRACT = MODAL_JS + r"""(() => {
       const b = p.getBoundingClientRect();
       cl = {left: Math.max(cl.left, b.left), top: Math.max(cl.top, b.top), right: Math.min(cl.right, b.right), bottom: Math.min(cl.bottom, b.bottom)};
     }
-    if (cl.right - cl.left < 8 || cl.bottom - cl.top < 8) continue;
-    r = {left: cl.left, top: cl.top, width: cl.right - cl.left, height: cl.bottom - cl.top};
+    let clipped = false;
+    if (cl.right - cl.left < 8 || cl.bottom - cl.top < 8) clipped = true;  // inside a pane but scrolled out of it
+    else r = {left: cl.left, top: cl.top, width: cl.right - cl.left, height: cl.bottom - cl.top};
     const st = getComputedStyle(el);
     if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
     let hidden = false;
@@ -175,7 +176,7 @@ EXTRACT = MODAL_JS + r"""(() => {
     const key = cx + '|' + cy + '|' + text;  // nested same-label interactives collapse to one row
     if (seen.has(key)) continue;
     seen.add(key);
-    rows.push([kind, (text || '-').replace(/\t/g, ' '), cx, cy, Math.round(r.width), Math.round(r.height), state]);
+    rows.push([kind, (text || '-').replace(/\t/g, ' '), cx, cy, Math.round(r.width), Math.round(r.height), state, clipped]);
   }
   return { rows, sy: Math.round(sy), sx: Math.round(sx), sh: document.documentElement.scrollHeight,
            vw: window.innerWidth, vh: window.innerHeight, modal: modalName };
@@ -345,9 +346,9 @@ def extract(state):
         except Exception:
             continue
         ox, oy = box["x"] + data["sx"] - sub["sx"], box["y"] + data["sy"] - sub["sy"]
-        raw += [[k, l, round(cx + ox), round(cy + oy), w, h, s] for k, l, cx, cy, w, h, s in sub["rows"]]
-    rows = [{"kind": k, "label": l, "cx": cx, "cy": cy, "w": w, "h": h, "state": s}
-            for k, l, cx, cy, w, h, s in raw]
+        raw += [[k, l, round(cx + ox), round(cy + oy), w, h, s, c] for k, l, cx, cy, w, h, s, c in sub["rows"]]
+    rows = [{"kind": k, "label": l, "cx": cx, "cy": cy, "w": w, "h": h, "state": s, "clipped": c}
+            for k, l, cx, cy, w, h, s, c in raw]
     pool = collections.defaultdict(list)
     for r in state["all"] + state.get("gone", []):  # gone: rows hidden by a modal or scrolled out, ids kept
         pool[(r["kind"], r["label"])].append(r)
@@ -365,13 +366,17 @@ def extract(state):
     state["sy"], state["sh"] = data["sy"], data["sh"]
     state["vw"], state["vh"] = data["vw"], data["vh"]  # CSS viewport; 980-ish when a page has no meta viewport
     state["modal"] = data.get("modal") or ""  
-    return [r for r in rows if data["sy"] - 40 <= r["cy"] <= data["sy"] + data["vh"] + 40
+    return [r for r in rows if not r["clipped"] and data["sy"] - 40 <= r["cy"] <= data["sy"] + data["vh"] + 40
             and data["sx"] - 40 <= r["cx"] <= data["sx"] + data["vw"] + 40]
 
 
 def ser(rows):
     head = "id\tkind\tlabel\tcx\tcy\tw\th\tstate"
-    return "\n".join([head] + ["\t".join(str(r[k]) for k in ("id", "kind", "label", "cx", "cy", "w", "h", "state"))
+    def cell(r, k):
+        if k == "state" and r.get("clipped"):
+            return (r["state"] + " " if r["state"] != "-" else "") + "scrolled-out"
+        return str(r[k])
+    return "\n".join([head] + ["\t".join(cell(r, k) for k in ("id", "kind", "label", "cx", "cy", "w", "h", "state"))
                               for r in rows])
 
 
@@ -394,10 +399,10 @@ def diff(old, new):
             added.append(r)
             continue
         dx, dy = r["cx"] - o["cx"], r["cy"] - o["cy"]
-        if abs(dx) > TOL or abs(dy) > TOL:
-            shifts[(dx, dy)].append(r)
-        elif r["state"] != o["state"]:
+        if r["state"] != o["state"]:
             flipped.append(r)
+        elif abs(dx) > TOL or abs(dy) > TOL:
+            shifts[(dx, dy)].append(r)
         else:
             unchanged += 1
     removed = list(by_id.values())
@@ -608,6 +613,11 @@ def locate(state, target, index):
     except ValueError:
         try:
             r = resolve(state["all"], target, index)
+            if r.get("clipped"):
+                state["page"].evaluate(REVEAL, r["label"])
+                state["page"].wait_for_timeout(300)
+                state["last"] = extract(state)
+                return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
         except ValueError:
             state["last"] = extract(state)  # the page may have changed since the last snapshot
             try:
