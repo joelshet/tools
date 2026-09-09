@@ -8,8 +8,10 @@
 Fast path: `open --headed URL`, then `read --all` once to learn the labels, then
 send whole sequences per call: `click "Item name" "Option A" "Add to cart"` or
 `run 'click "Item name" "Option A"' 'wait 5 --for Added'`. Round trips are the
-cost; a click reaches any label on the page, so scrolling is for looking, never
-for reaching.
+cost. A label matches by substring (`click "Add to cart"` hits "Add to cart
+$7.90"), a click reaches any label on the page, and every action already waits
+for the page to settle and for late targets, so no sleeps, no scrolling to
+reach things, no re-reading to confirm what the diff reported.
 
 A daemon holds one headless (or headed) browser per named session; commands talk
 to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
