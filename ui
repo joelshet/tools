@@ -616,12 +616,16 @@ def locate(state, target, index):
                 try:
                     r = resolve(state["all"], target, index)
                 except ValueError:
-                    # not in any snapshot: maybe clipped by a horizontal scroller or a virtual list
-                    if not state["page"].evaluate(REVEAL, target):
-                        raise
-                    state["page"].wait_for_timeout(300)
-                    state["last"] = extract(state)
-                    return resolve(state["last"], target, index), f"scrolled {target!r} into view"
+                    # not in any snapshot: clipped by a horizontal scroller or a virtual list, or still loading
+                    deadline = time.time() + 2.5
+                    while True:
+                        if state["page"].evaluate(REVEAL, target):
+                            state["page"].wait_for_timeout(300)
+                            state["last"] = extract(state)
+                            return resolve(state["last"], target, index), f"scrolled {target!r} into view"
+                        if time.time() > deadline:
+                            raise
+                        state["page"].wait_for_timeout(300)
         state["page"].evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
         state["page"].wait_for_timeout(300)
         state["last"] = extract(state)
@@ -724,7 +728,8 @@ def handle(state, req):
             except Exception as e:
                 if len(steps) == 1:
                     raise
-                raise ValueError(f"step {i} click {st['target']!r}: {e} — steps 1-{i - 1} were done; run read")
+                done = f"steps 1-{i - 1} were done" if i > 1 else "nothing was done"
+                raise ValueError(f"step {i} click {st['target']!r}: {e} — {done}; run read")
             settle(page)
             if r["kind"] in FIELDS and page.evaluate(FOCUSED):
                 note = "; ".join(filter(None, [note, f"focused {r['id']}: type to fill it"]))
@@ -753,9 +758,11 @@ def handle(state, req):
             except Exception as e:
                 if "were done" in str(e):
                     raise ValueError(f"step {i} {st['label']}: {e}")
-                raise ValueError(f"step {i} {st['label']}: {e} — steps 1-{i - 1} were done; run read")
+                done = f"steps 1-{i - 1} were done" if i > 1 else "nothing was done"
+                raise ValueError(f"step {i} {st['label']}: {e} — {done}; run read")
             if "error" in o:
-                raise ValueError(f"step {i} {st['label']}: {o['error']} — steps 1-{i - 1} were done; run read")
+                done = f"steps 1-{i - 1} were done" if i > 1 else "nothing was done"
+                raise ValueError(f"step {i} {st['label']}: {o['error']} — {done}; run read")
             flips = [l for l in (o.get("diff") or "").split("\n")[1:] if l.startswith("~ ") and "[" in l]
             body = o.get("tsv") or o.get("text")
             lines.append(f"{i}. {st['label']}: " + ("; ".join(filter(None, [o.get("note")] + flips)) or "ok")
