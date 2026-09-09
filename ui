@@ -172,6 +172,7 @@ EXTRACT = MODAL_JS + r"""(() => {
       if (p !== el && /(auto|scroll|overlay)/.test(pcs.overflowY) && p.scrollHeight > p.clientHeight) break;  // its own pane scrolls it
     }
     if (pinned) state = state === '-' ? 'pinned' : state + ' pinned';
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') state = state === '-' ? 'disabled' : state + ' disabled';
     const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
     const key = cx + '|' + cy + '|' + text;  // nested same-label interactives collapse to one row
     if (seen.has(key)) continue;
