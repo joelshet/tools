@@ -16,7 +16,9 @@ state marks fixed or sticky elements that stay on screen while scrolling. `text`
 prints the page's readable text; snapshots list only interactive elements and
 headings. `read` shows the viewport and `read --all` the whole page; `click`
 accepts any label on the page and scrolls off-screen targets into view, so
-scrolling is for looking, never for reaching. Labels are visible text (screen-
+scrolling is for looking, never for reaching. Round trips are the cost: once a
+sequence is known, send it in one call (`click A B C`, or `run` with several
+commands) instead of one command per turn. Labels are visible text (screen-
 reader-only spans dropped), or the aria-label when it says more. Targets under a
 sticky header are re-centered first. `scroll DY TARGET` scrolls the pane holding
 TARGET (drawers, virtual lists) instead of the page. `wait --for TEXT` returns
@@ -343,7 +345,7 @@ def extract(state):
     rows = [{"kind": k, "label": l, "cx": cx, "cy": cy, "w": w, "h": h, "state": s}
             for k, l, cx, cy, w, h, s in raw]
     pool = collections.defaultdict(list)
-    for r in state["all"]:
+    for r in state["all"] + state.get("gone", []):  # gone: rows hidden by a modal or scrolled out, ids kept
         pool[(r["kind"], r["label"])].append(r)
     for r in rows:
         cands = pool.get((r["kind"], r["label"]))
@@ -354,6 +356,7 @@ def extract(state):
         else:
             state["n"] += 1
             r["id"] = f"e{state['n']}"
+    state["gone"] = [r for cands in pool.values() for r in cands][-2000:]
     state["all"] = rows
     state["sy"], state["sh"] = data["sy"], data["sh"]
     state["vw"], state["vh"] = data["vw"], data["vh"]  # CSS viewport; 980-ish when a page has no meta viewport
@@ -498,12 +501,24 @@ def tree_bytes(page):
         return 0
 
 
+QUIET = r"""() => new Promise(res => {
+  let t = setTimeout(done, 150);
+  const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, 150); });
+  mo.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
+  const hard = setTimeout(done, 700);
+  function done() { mo.disconnect(); clearTimeout(hard); clearTimeout(t); res(); }
+})"""
+
+
 def settle(page):
     try:
         page.wait_for_load_state("load", timeout=3000)
     except Exception:
         pass
-    page.wait_for_timeout(600)
+    try:
+        page.evaluate(QUIET)  # returns once the DOM has been quiet for 150ms (700ms cap)
+    except Exception:  # navigation mid-wait
+        page.wait_for_timeout(300)
 
 
 def current_page(state):
@@ -695,19 +710,53 @@ def handle(state, req):
         return {k: v for k, v in
                 {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state), "note": bot_check(state)}.items() if v}
     if op == "click":
-        r, note = locate(state, req["target"], req.get("index"))
-        click_at(state, r)
-        settle(page)
-        if r["kind"] in FIELDS and page.evaluate(FOCUSED):
-            note = "; ".join(filter(None, [note, f"focused {r['id']}: type to fill it"]))
-        out = act_result(state, note)
-        for _ in range(8):  # drawers and dialogs that animate or fetch land after settle(): keep looking, up to ~3s
-            if "\n" in out["diff"] or "url" in out or "note" in out:
-                break
-            page.wait_for_timeout(350)
+        steps = req.get("steps") or [{"target": req["target"], "index": req.get("index")}]
+        base = state["last"]
+        lines = []
+        for i, st in enumerate(steps, 1):
+            try:
+                r, note = locate(state, st["target"], st.get("index"))
+                click_at(state, r)
+            except Exception as e:
+                if len(steps) == 1:
+                    raise
+                raise ValueError(f"step {i} click {st['target']!r}: {e} — steps 1-{i - 1} were done; run read")
+            settle(page)
+            if r["kind"] in FIELDS and page.evaluate(FOCUSED):
+                note = "; ".join(filter(None, [note, f"focused {r['id']}: type to fill it"]))
             out = act_result(state, note)
-        else:
-            out["diff"] += "\n(no visible change)"
+            for _ in range(8):  # drawers and dialogs that animate or fetch land after settle(): keep looking, up to ~3s
+                if "\n" in out["diff"] or "url" in out or "note" in out:
+                    break
+                page.wait_for_timeout(350)
+                out = act_result(state, note)
+            else:
+                out["diff"] += "\n(no visible change)"
+            if len(steps) > 1:
+                flips = [l for l in out["diff"].split("\n")[1:] if l.startswith("~ ") and "[" in l]
+                lines.append(f"{i}. click {st['target'][:30]!r}: " + ("; ".join(filter(None, [out.get("note")] + flips)) or "ok"))
+        if len(steps) > 1:
+            out = {"diff": "\n".join(lines) + "\n" + diff(base, state["last"])}
+            if state["page"].url != state["url"]:
+                out["url"] = state["url"] = state["page"].url
+        return out
+    if op == "run":  # several commands in one round trip; stops at the first error
+        base = state["last"]
+        lines = []
+        for i, st in enumerate(req["steps"], 1):
+            try:
+                o = handle(state, st)
+            except Exception as e:
+                raise ValueError(f"step {i} {st['label']}: {e} — steps 1-{i - 1} were done; run read")
+            if "error" in o:
+                raise ValueError(f"step {i} {st['label']}: {o['error']} — steps 1-{i - 1} were done; run read")
+            flips = [l for l in (o.get("diff") or "").split("\n")[1:] if l.startswith("~ ") and "[" in l]
+            body = o.get("tsv") or o.get("text")
+            lines.append(f"{i}. {st['label']}: " + ("; ".join(filter(None, [o.get("note")] + flips)) or "ok")
+                         + ("\n" + body if body else ""))
+        out = {"diff": "\n".join(lines) + "\n" + diff(base, state["last"])}
+        if state["page"].url != state["url"]:
+            out["url"] = state["url"] = state["page"].url
         return out
     if op == "select":
         r, note = locate(state, req["target"], req.get("index"))
@@ -725,7 +774,7 @@ def handle(state, req):
         elif not page.evaluate(FOCUSED):
             raise ValueError("nothing editable is focused — pass --into TARGET to click a field first")
         page.keyboard.type(req["text"], delay=25)
-        page.wait_for_timeout(700)
+        settle(page)
         return act_result(state, note)
     if op == "hover":
         r, note = locate(state, req["target"], req.get("index"))
@@ -860,7 +909,7 @@ def emit(resp):
     print(f"[{len(out)}B {resp['ms']}ms]", file=sys.stderr)
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(prog="ui", description=__doc__.split("\n")[0])
     p.add_argument("-s", "--session", default="default", help="named session, for driving several sites in parallel (default: default)")
     for flag in ("--headed", "--video", "--profile"):  # accepted before or after `open`
@@ -878,9 +927,9 @@ def main():
     sp = sub.add_parser("html", help="cleaned HTML of the page or one element: structure and attributes the snapshot omits")
     sp.add_argument("target", nargs="?", help="element id (e12) or label text; whole page if omitted")
     sp.add_argument("--offset", type=int, default=0, help="character offset to continue from")
-    sp = sub.add_parser("click", help="click an element; returns the diff it caused")
-    sp.add_argument("target", help="element id (e12) or label text")
-    sp.add_argument("index", nargs="?", type=int, help="pick among multiple label matches (1-based)")
+    sp = sub.add_parser("click", help="click one element, or several in order (one round trip); returns the diff")
+    sp.add_argument("targets", nargs="+", metavar="TARGET",
+                    help="element id (e12) or label text; a bare number after a label picks among its matches (1-based)")
     sp = sub.add_parser("type", help="type into the focused element; returns the diff")
     sp.add_argument("text", help="text to type")
     sp.add_argument("--into", help="element (id or label) to click first")
@@ -903,6 +952,8 @@ def main():
     sp = sub.add_parser("wait", help="wait for the page to change on its own; returns the diff")
     sp.add_argument("secs", nargs="?", type=float, default=2, help="seconds to wait (max 10, default 2; max 60 with --for)")
     sp.add_argument("--for", dest="for_", metavar="TEXT", help="return as soon as TEXT appears on the page; error if it doesn't")
+    sp = sub.add_parser("run", help="run several commands in one round trip, e.g. run 'click Migas Taco' 'click Flour' 'click Add to cart'; stops at the first error")
+    sp.add_argument("lines", nargs="*", metavar="COMMAND", help="a ui command line (quoted); read from stdin, one per line, if none given")
     sub.add_parser("ledger", help="per-action cost vs accessibility-tree and screenshot baselines")
     sp = sub.add_parser("eval", help=argparse.SUPPRESS)
     sp.add_argument("js")
@@ -913,29 +964,21 @@ def main():
     sp.add_argument("--headed", action="store_true")
     sp.add_argument("--video", action="store_true")
     sp.add_argument("--profile", action="store_true")
-    a = p.parse_args()
+    return p
 
-    sock = str(STATE / f"{a.session}.sock")
-    if a.cmd == "daemon":
-        STATE.mkdir(parents=True, exist_ok=True)
-        pdir = STATE / f"profile-{a.session}" if a.profile else None
-        run_daemon(a.url, sock, headed=a.headed, video=a.video, profile_dir=pdir)
-        return
-    if a.cmd == "open":
-        flags = [f for f, on in [("--headed", a.headed), ("--video", a.video), ("--profile", a.profile)] if on]
-        emit(ensure_session(a.session, sock, a.url, flags))
-        return
-    if not alive(sock):
-        print(f"no live session {a.session!r} — start one with: ui open URL", file=sys.stderr)
-        sys.exit(1)
 
-    req = {"op": a.cmd}
+def build_req(p, a):
+    req = {"op": a.cmd, "label": a.cmd}
     if a.cmd == "read" and a.all:
         req.update(all=True, label="read --all")
     if a.cmd == "click":
-        req.update(target=a.target, label=f"click {a.target[:20]}")
-        if a.index:
-            req["index"] = a.index
+        steps = []
+        for t in a.targets:
+            if t.isdigit() and steps:
+                steps[-1]["index"] = int(t)
+            else:
+                steps.append({"target": t})
+        req.update(steps=steps, label="click " + " / ".join(st["target"][:20] for st in steps))
     elif a.cmd == "type":
         req.update(text=a.text, label=f"type {a.text[:20]}")
         if a.into:
@@ -970,6 +1013,39 @@ def main():
         req.update(dy=a.dy, label=f"scroll {a.dy}")
         if a.target:
             req["target"] = a.target
+    return req
+
+
+def main():
+    p = build_parser()
+    a = p.parse_args()
+
+    sock = str(STATE / f"{a.session}.sock")
+    if a.cmd == "daemon":
+        STATE.mkdir(parents=True, exist_ok=True)
+        pdir = STATE / f"profile-{a.session}" if a.profile else None
+        run_daemon(a.url, sock, headed=a.headed, video=a.video, profile_dir=pdir)
+        return
+    if a.cmd == "open":
+        flags = [f for f, on in [("--headed", a.headed), ("--video", a.video), ("--profile", a.profile)] if on]
+        emit(ensure_session(a.session, sock, a.url, flags))
+        return
+    if not alive(sock):
+        print(f"no live session {a.session!r} — start one with: ui open URL", file=sys.stderr)
+        sys.exit(1)
+
+    if a.cmd == "run":
+        import shlex
+        lines = a.lines or [l for l in sys.stdin.read().splitlines() if l.strip()]
+        steps = []
+        for line in lines:
+            sa = p.parse_args(shlex.split(line))
+            if sa.cmd in ("open", "stop", "daemon", "run", "ledger", "ping"):
+                p.error(f"{sa.cmd} cannot be a run step")
+            steps.append(build_req(p, sa))
+        req = {"op": "run", "steps": steps, "label": f"run {len(steps)} steps"}
+    else:
+        req = build_req(p, a)
     resp = call(sock, req)
     if a.cmd == "ledger":
         for r in resp["rows"]:
