@@ -44,10 +44,8 @@ PICKER = {"time", "date", "datetime-local", "month", "week"}  # native picker ov
 FIELDS = {"text", "search", "email", "tel", "url", "number", "password", "textarea", "combobox", "textbox", "input"}
 TEXT_CAP = 6000  # chars of readable text per `text` call
 
-EXTRACT = r"""(() => {
-  const seen = new Set(), rows = [];
-  const sx = window.scrollX, sy = window.scrollY;
-  // an open modal owns the page: list only what is inside the topmost one
+MODAL_JS = r"""
+const findModal = () => {
   const shown = (el) => { const b = el.getBoundingClientRect(); const cs = getComputedStyle(el);
     return b.width > 0 && b.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0'; };
   let modal = null;
@@ -56,6 +54,15 @@ EXTRACT = r"""(() => {
     const b = el.getBoundingClientRect(), area = b.width * b.height / (window.innerWidth * window.innerHeight);
     if (el.getAttribute('aria-modal') === 'true' || el.tagName === 'DIALOG' || area >= 0.6) modal = el;  // last one is on top
   }
+  return modal;
+};
+"""
+
+EXTRACT = MODAL_JS + r"""(() => {
+  const seen = new Set(), rows = [];
+  const sx = window.scrollX, sy = window.scrollY;
+  // an open modal owns the page: list only what is inside the topmost one
+  const modal = findModal();
   const modalName = modal ? ((modal.getAttribute('aria-label') || modal.querySelector('h1,h2,h3')?.innerText || 'dialog')
     .trim().replace(/\s+/g, ' ').slice(0, 40)) : '';
   const sel = 'a, button, input, select, textarea, summary, h1, h2, h3, img, [onclick], ' +
@@ -180,11 +187,19 @@ SELECT = r"""([x, y, opt]) => {
   return '';
 }"""
 
-SCROLL = r"""([dy, x, y]) => {
+SCROLL = MODAL_JS + r"""([dy, x, y]) => {
   const scrollable = (el) => el.scrollHeight > el.clientHeight + 20 && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY);
   if (x != null) {  // scroll the pane that contains the target element
     for (let el = document.elementFromPoint(x, y); el && el !== document.body; el = el.parentElement)
       if (scrollable(el)) { const t0 = el.scrollTop; el.scrollBy(0, dy); if (el.scrollTop !== t0) return 'pane'; }
+  }
+  const modal = findModal();
+  if (modal) {  // the page behind a modal is not what the reader is looking at
+    let best = scrollable(modal) ? modal : null;
+    for (const el of modal.querySelectorAll('*'))
+      if (scrollable(el) && (!best || el.clientHeight > best.clientHeight)) best = el;
+    if (best) { const t0 = best.scrollTop; best.scrollBy(0, dy); if (best.scrollTop !== t0) return 'pane'; }
+    return '';
   }
   const y0 = window.scrollY;
   window.scrollBy(0, dy);
@@ -650,11 +665,13 @@ def handle(state, req):
         click_at(state, r)
         settle(page)
         out = act_result(state, note)
-        if "\n" not in out["diff"] and "url" not in out and "note" not in out:
-            page.wait_for_timeout(900)  # panels that animate open or closed land after settle()
+        for _ in range(8):  # drawers and dialogs that animate or fetch land after settle(): keep looking, up to ~3s
+            if "\n" in out["diff"] or "url" in out or "note" in out:
+                break
+            page.wait_for_timeout(350)
             out = act_result(state, note)
-            if "\n" not in out["diff"] and "url" not in out and "note" not in out:
-                out["diff"] += "\n(no visible change)"
+        else:
+            out["diff"] += "\n(no visible change)"
         return out
     if op == "select":
         r, note = locate(state, req["target"], req.get("index"))
