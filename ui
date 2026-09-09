@@ -628,13 +628,17 @@ def locate(state, target, index):
                     r = resolve(state["all"], target, index)
                 except ValueError:
                     # not in any snapshot: clipped by a horizontal scroller or a virtual list, or still loading
-                    deadline = time.time() + 2.5
+                    deadline = time.time() + 5  # long enough for a closing modal or a fetch to reveal it
                     while True:
                         if state["page"].evaluate(REVEAL, target):
                             state["page"].wait_for_timeout(300)
                             state["last"] = extract(state)
-                            return resolve(state["last"], target, index), f"scrolled {target!r} into view"
-                        if time.time() > deadline:
+                            try:
+                                return resolve(state["last"], target, index), f"scrolled {target!r} into view"
+                            except ValueError:
+                                if time.time() > deadline:  # still hidden, e.g. behind a modal that is closing
+                                    raise
+                        elif time.time() > deadline:
                             raise
                         state["page"].wait_for_timeout(300)
         state["page"].evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
