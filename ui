@@ -20,7 +20,9 @@ before a click; targets under a sticky header are re-centered first. `scroll DY
 TARGET` scrolls the pane holding TARGET (drawers, virtual lists) instead of the
 page. `wait --for TEXT` returns as soon as TEXT shows up. `open` with a flag the
 live session lacks (--headed, --video, --profile) restarts that session.
-New tabs are followed automatically. One-time setup beyond deps:
+New tabs are followed automatically. A session is shared by name: two drivers on
+`default` will trample each other, so parallel agents each take `-s NAME`.
+One-time setup beyond deps:
 playwright install chromium.
 """
 import argparse
@@ -45,6 +47,17 @@ TEXT_CAP = 6000  # chars of readable text per `text` call
 EXTRACT = r"""(() => {
   const seen = new Set(), rows = [];
   const sx = window.scrollX, sy = window.scrollY;
+  // an open modal owns the page: list only what is inside the topmost one
+  const shown = (el) => { const b = el.getBoundingClientRect(); const cs = getComputedStyle(el);
+    return b.width > 0 && b.height > 0 && cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0'; };
+  let modal = null;
+  for (const el of document.querySelectorAll('[aria-modal="true"], dialog[open], [role="dialog"], [role="alertdialog"]')) {
+    if (!shown(el)) continue;
+    const b = el.getBoundingClientRect(), area = b.width * b.height / (window.innerWidth * window.innerHeight);
+    if (el.getAttribute('aria-modal') === 'true' || el.tagName === 'DIALOG' || area >= 0.6) modal = el;  // last one is on top
+  }
+  const modalName = modal ? ((modal.getAttribute('aria-label') || modal.querySelector('h1,h2,h3')?.innerText || 'dialog')
+    .trim().replace(/\s+/g, ' ').slice(0, 40)) : '';
   const sel = 'a, button, input, select, textarea, summary, h1, h2, h3, img, [onclick], ' +
     '[contenteditable="true"], [role="button"], [role="link"], [role="menuitem"], [role="tab"], ' +
     '[role="checkbox"], [role="switch"], [role="textbox"], [role="option"], [role="radio"], ' +
@@ -89,6 +102,8 @@ EXTRACT = r"""(() => {
       if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') { hidden = true; break; }
     }
     if (hidden) continue;
+    if (modal && !modal.contains(el)) continue;
+    if (el.closest('[aria-hidden="true"], [inert]')) continue;  // hidden from assistive tech: not operable
     const tag = el.tagName.toLowerCase(), role = el.getAttribute('role');
     let kind = role || tag, state = '-';
     let text = vis(el).trim().replace(/\s+/g, ' ');
@@ -132,9 +147,10 @@ EXTRACT = r"""(() => {
       state = (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true') ? 'on' : 'off';
     // fixed or sticky (itself or a near ancestor): stays on screen, so no scrolling is needed to reach it
     let pinned = false;
-    for (let p = el, i = 0; p && p !== document.body && i < 6; p = p.parentElement, i++) {
-      const ps = getComputedStyle(p).position;
-      if (ps === 'fixed' || ps === 'sticky') { pinned = true; break; }
+    for (let p = el, i = 0; p && p !== document.body && p !== modal && i < 8; p = p.parentElement, i++) {
+      const pcs = getComputedStyle(p);
+      if (pcs.position === 'fixed' || pcs.position === 'sticky') { pinned = true; break; }
+      if (p !== el && /(auto|scroll|overlay)/.test(pcs.overflowY) && p.scrollHeight > p.clientHeight) break;  // its own pane scrolls it
     }
     if (pinned) state = state === '-' ? 'pinned' : state + ' pinned';
     const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
@@ -144,7 +160,7 @@ EXTRACT = r"""(() => {
     rows.push([kind, (text || '-').replace(/\t/g, ' '), cx, cy, Math.round(r.width), Math.round(r.height), state]);
   }
   return { rows, sy: Math.round(sy), sx: Math.round(sx), sh: document.documentElement.scrollHeight,
-           vw: window.innerWidth, vh: window.innerHeight };
+           vw: window.innerWidth, vh: window.innerHeight, modal: modalName };
 })()"""
 
 SELECT = r"""([x, y, opt]) => {
@@ -238,7 +254,10 @@ HTML = r"""([x, y, whole]) => {
   return clone.outerHTML;
 }"""
 
-TEXT = r"""(document.querySelector('main, article, [role="main"]') || document.body).innerText"""
+TEXT = r"""(() => {
+  const m = [...document.querySelectorAll('[aria-modal="true"], dialog[open]')].filter(e => e.getBoundingClientRect().height > 0).pop();
+  return (m || document.querySelector('main, article, [role="main"]') || document.body).innerText;
+})()"""
 
 RIPPLE = """
 addEventListener('mousedown', e => {
@@ -303,6 +322,7 @@ def extract(state):
     state["all"] = rows
     state["sy"], state["sh"] = data["sy"], data["sh"]
     state["vw"], state["vh"] = data["vw"], data["vh"]  # CSS viewport; 980-ish when a page has no meta viewport
+    state["modal"] = data.get("modal") or ""  
     return [r for r in rows if data["sy"] - 40 <= r["cy"] <= data["sy"] + data["vh"] + 40
             and data["sx"] - 40 <= r["cx"] <= data["sx"] + data["vw"] + 40]
 
@@ -369,6 +389,7 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(sock)
     srv.listen(1)
+    ino = os.stat(sock).st_ino
     ledger = []
     with sync_playwright() as pl:
         ctx_opts = {"viewport": {"width": W, "height": H}, "is_mobile": True}  # honor meta viewport
@@ -404,10 +425,12 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             f = conn.makefile("rwb")
             req = json.loads(f.readline())
             t0 = time.time()
+            gone = False
             try:
                 out = handle(state, req)
             except Exception as e:
                 out = {"error": f"{type(e).__name__}: {e}"}
+                gone = "browser closed" in str(e) or type(e).__name__ == "TargetClosedError"
             out["ms"] = int((time.time() - t0) * 1000)
             if req["op"] not in ("ping", "stop", "ledger") and "error" not in out:
                 sent = out.get("diff") or out.get("tsv") or out.get("text") or ""
@@ -418,7 +441,7 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             f.write(json.dumps(out).encode() + b"\n")
             f.flush()
             conn.close()
-            if req["op"] == "stop":
+            if req["op"] == "stop" or gone:
                 break
         vid = state["page"].video if video else None
         ctx.close()
@@ -426,7 +449,11 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             print(f"video: {vid.path()}", flush=True)
         if not profile_dir:
             browser.close()
-    os.unlink(sock)
+    try:
+        if os.stat(sock).st_ino == ino:
+            os.unlink(sock)
+    except FileNotFoundError:
+        pass
 
 
 def tree_bytes(page):
@@ -448,7 +475,10 @@ def current_page(state):
     """Follow new tabs and survive closed ones; returns True if the page changed."""
     pages = [p for p in state["page"].context.pages if not p.is_closed()]
     if not pages:
-        raise RuntimeError("all pages closed")
+        try:
+            pages = [state["page"].context.new_page()]  # every tab was closed: start a blank one
+        except Exception as e:
+            raise RuntimeError(f"browser closed ({type(e).__name__}); the session will exit, run ui open again")
     if state["page"].is_closed() or pages[-1] is not state["page"]:
         state["page"] = pages[-1]
         try:
@@ -500,8 +530,9 @@ def clip(txt, off):
 
 def pos(state):
     vh = state.get("vh") or state["h"]
+    modal = f"in modal {state['modal']!r}: rows are its contents; press Escape or click Close to leave it" if state.get("modal") else None
     if state["sh"] <= vh + 50:
-        return None
+        return modal
     s = f"y {state['sy']}-{min(state['sy'] + vh, state['sh'])} of {state['sh']}"
     above = sum(1 for r in state["all"] if r["cy"] < state["sy"] - 40)
     below = sum(1 for r in state["all"] if r["cy"] > state["sy"] + vh + 40)
@@ -509,7 +540,7 @@ def pos(state):
         s += f"; {above} elems above"
     if below:
         s += f"; {below} elems below"
-    return s
+    return s + ("\n" + modal if modal else "")
 
 
 def locate(state, target, index):
@@ -542,7 +573,11 @@ def bot_check(state):
 
 def act_result(state, note=None):
     switched = current_page(state)
+    before = state.get("modal") or ""
     new = extract(state)
+    after = state.get("modal") or ""
+    if after != before:
+        note = "; ".join(filter(None, [note, f"modal opened: {after!r}" if after else f"modal closed: {before!r}"]))
     out = {"diff": diff(state["last"], new)}
     state["last"] = new
     bot = bot_check(state)
@@ -738,7 +773,7 @@ def ensure_session(name, sock, url, flags):
         # a live session can't gain --headed/--video/--profile; restart it with the union
         print(f"restarting session {name!r} with {' '.join(missing)}", file=sys.stderr)
         call(sock, {"op": "stop"})
-        for _ in range(20):
+        for _ in range(40):
             if not alive(sock):
                 break
             time.sleep(0.25)
