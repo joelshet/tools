@@ -5,28 +5,31 @@
 # ///
 """Operate a website as a persistent session; every action returns the diff it caused.
 
+Fast path: `open --headed URL`, then `read --all` once to learn the labels, then
+send whole sequences per call: `click "Migas Taco" Flour "Verde (Mild)" "Add to
+cart"` or `run 'click "Migas Taco" Flour' 'wait 5 --for Added'`. Round trips are
+the cost; a click reaches any label on the page, so scrolling is for looking,
+never for reaching.
+
 A daemon holds one headless (or headed) browser per named session; commands talk
 to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
 (id kind label cx cy w h state); ids are stable for the life of the session, so
 a remembered id stays valid until the element leaves the page. Actions answer
 with the change they caused, so "= N unchanged" alone means the action did
 nothing visible; state flips (checkbox, radio, tab, select) report themselves,
-and toasts (role=status/alert, aria-live) appear as `status` rows. A `pinned`
-state marks fixed or sticky elements that stay on screen while scrolling. `text`
-prints the page's readable text; snapshots list only interactive elements and
-headings. `read` shows the viewport and `read --all` the whole page; `click`
-accepts any label on the page and scrolls off-screen targets into view, so
-scrolling is for looking, never for reaching. Round trips are the cost: once a
-sequence is known, send it in one call (`click A B C`, or `run` with several
-commands) instead of one command per turn. Labels are visible text (screen-
-reader-only spans dropped), or the aria-label when it says more. Targets under a
-sticky header are re-centered first. `scroll DY TARGET` scrolls the pane holding
-TARGET (drawers, virtual lists) instead of the page. `wait --for TEXT` returns
+and toasts (role=status/alert, aria-live) appear as `status` rows. `pinned`
+marks fixed or sticky elements that stay on screen while scrolling, `disabled`
+marks controls that will not take a click, and `scrolled-out` (in `read --all`)
+marks rows inside a pane that a click will scroll to. An open modal owns the
+snapshot: rows are its contents until it closes (Escape or its Close button),
+and `text` and `scroll` work inside it. Labels are visible text (screen-reader-
+only spans dropped), or the aria-label when it says more. `scroll DY TARGET`
+scrolls the pane holding TARGET instead of the page. `wait --for TEXT` returns
 as soon as TEXT shows up. `open` with a flag the live session lacks (--headed,
---video, --profile) restarts that session. New tabs are followed automatically.
-A session is shared by name: two drivers on `default` will trample each other,
-so parallel agents each take `-s NAME`. One-time setup beyond deps: playwright
-install chromium.
+--video, --profile) restarts that session; headless browsers fail bot checks,
+so use --headed for sites that show one. A session is shared by name: parallel
+agents each take `-s NAME`. One-time setup beyond deps: playwright install
+chromium.
 """
 import argparse
 import collections
@@ -967,7 +970,7 @@ def emit(resp):
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="ui", description=__doc__.split("\n")[0])
+    p = argparse.ArgumentParser(prog="ui", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-s", "--session", default="default", help="named session, for driving several sites in parallel (default: default)")
     for flag in ("--headed", "--video", "--profile"):  # accepted before or after `open`
         p.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
