@@ -477,8 +477,13 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
             ctx.add_init_script(RIPPLE)
         dialogs = []
 
+        inflight = set()
+
         def arm(p):
             p.on("dialog", lambda d: (dialogs.append(f"{d.type}: {d.message}"), d.accept()))
+            p.on("request", lambda r: inflight.add(r) if r.resource_type in ("xhr", "fetch") else None)
+            p.on("requestfinished", lambda r: inflight.discard(r))
+            p.on("requestfailed", lambda r: inflight.discard(r))
 
         for p in ctx.pages:  # persistent context: initial page predates the listener
             arm(p)
@@ -488,7 +493,7 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
         page.wait_for_timeout(1500)
 
         state = {"page": page, "all": [], "n": 0, "sy": 0, "sh": 0, "url": page.url, "dialogs": dialogs,
-                 "w": W, "h": H, "headed": headed}
+                 "w": W, "h": H, "headed": headed, "inflight": inflight}
         state["last"] = extract(state)
         print("ready", flush=True)
         while True:
@@ -537,11 +542,11 @@ def tree_bytes(page):
         return 0
 
 
-QUIET = r"""() => new Promise(res => {
-  let t = setTimeout(done, 150);
-  const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, 150); });
+QUIET = r"""([quiet, cap]) => new Promise(res => {
+  let t = setTimeout(done, quiet);
+  const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(done, quiet); });
   mo.observe(document, {subtree: true, childList: true, attributes: true, characterData: true});
-  const hard = setTimeout(done, 700);
+  const hard = setTimeout(done, cap);
   function done() { mo.disconnect(); clearTimeout(hard); clearTimeout(t); res(); }
 })"""
 
@@ -552,9 +557,30 @@ def settle(page):
     except Exception:
         pass
     try:
-        page.evaluate(QUIET)  # returns once the DOM has been quiet for 150ms (700ms cap)
+        page.evaluate(QUIET, [150, 700])  # returns once the DOM has been quiet for 150ms (700ms cap)
     except Exception:  # navigation mid-wait
         page.wait_for_timeout(300)
+
+
+def quiet(page, ms, cap):
+    try:
+        page.evaluate(QUIET, [ms, cap])
+    except Exception:
+        page.wait_for_timeout(min(ms, 300))
+
+
+def idle(state, cap_ms):
+    """Wait until no xhr/fetch is in flight and the DOM has been quiet, or cap_ms; True if it settled."""
+    page = state["page"]
+    deadline = time.time() + cap_ms / 1000
+    while time.time() < deadline:
+        if not state.get("inflight"):
+            quiet(page, 300, 1000)
+            if not state.get("inflight"):
+                return True
+        else:
+            page.wait_for_timeout(100)
+    return False
 
 
 def current_page(state):
@@ -695,7 +721,13 @@ def act_result(state, note=None):
     after = state.get("modal") or ""
     if after != before:
         note = "; ".join(filter(None, [note, f"modal opened: {after!r}" if after else f"modal closed: {before!r}"]))
-    out = {"diff": diff(state["last"], new)}
+    extra = ""
+    if after and after != before:  # a modal just opened: show all of it, not only the part in view
+        shown = {r["id"] for r in new}
+        rest = [r for r in state["all"] if r["id"] not in shown]
+        if rest:
+            extra = "\n" + "\n".join(ser(rest).split("\n")[1:])
+    out = {"diff": diff(state["last"], new) + extra}
     state["last"] = new
     bot = bot_check(state)
     notes = ([note] if note else []) + ([bot] if bot else []) + (["switched to new tab"] if switched else []) \
@@ -780,9 +812,14 @@ def handle(state, req):
             settle(page)
             if r["kind"] in FIELDS and page.evaluate(FOCUSED):
                 note = "; ".join(filter(None, [note, f"focused {r['id']}: type to fill it"]))
+            step_base, step_modal = state["last"], state.get("modal")
             out = act_result(state, note)
             for _ in range(8):  # drawers and dialogs that animate or fetch land after settle(): keep looking, up to ~3s
                 if "\n" in out["diff"] or "url" in out or "note" in out:
+                    # something changed: let the rest of it land (requests, cart totals, closing panels) before reporting
+                    settled = idle(state, 3000)
+                    state["last"], state["modal"] = step_base, step_modal
+                    out = act_result(state, note if settled else "; ".join(filter(None, [note, "still in flight after 3s"])))
                     break
                 page.wait_for_timeout(350)
                 out = act_result(state, note)
@@ -991,7 +1028,9 @@ def build_parser():
     sp.add_argument("--offset", type=int, default=0, help="character offset to continue from")
     sp = sub.add_parser("click", help="click one element, or several in order (one round trip); returns the diff")
     sp.add_argument("targets", nargs="+", metavar="TARGET",
-                    help="element id (e12) or label text; a bare number after a label picks among its matches (1-based)")
+                    help="element id (e12) or label text, matched case-insensitively by substring (\"Add to cart\" hits "
+                         "\"Add to cart $7.90\"; a 40-char label is matched by its start); a bare number after a label "
+                         "picks among its matches (1-based)")
     sp = sub.add_parser("type", help="type into the focused element; returns the diff")
     sp.add_argument("text", help="text to type")
     sp.add_argument("--into", help="element (id or label) to click first")
