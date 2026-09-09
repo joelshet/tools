@@ -241,10 +241,24 @@ OBSCURED = r"""([x, y, w, h]) => {
 
 REVEAL = r"""(t) => {
   t = t.toLowerCase();
-  const sel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [role="radio"], [role="checkbox"]';
+  const sel = 'a, button, input, select, textarea, summary, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="option"], [role="radio"], [role="checkbox"], [role="menuitemradio"]';
+  const vis = (n) => {  // same visible-text rule as the snapshot
+    if (n.nodeType === 3) return n.textContent;
+    if (n.nodeType !== 1) return '';
+    const cs = getComputedStyle(n);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return '';
+    const b = n.getBoundingClientRect();
+    if ((b.width < 2 || b.height < 2) && n.textContent.trim()) return '';
+    let out = '';
+    for (const c of n.childNodes) out += vis(c) + ' ';
+    return out;
+  };
   let el = null;
   for (const e of document.querySelectorAll(sel)) {
-    const txt = (e.innerText || e.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    let txt = vis(e).trim().replace(/\s+/g, ' ');
+    const al = (e.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+    if (al.length > txt.length) txt = al;
+    txt = txt.toLowerCase();
     if (!txt) continue;
     if (txt === t) { el = e; break; }
     if (!el && txt.includes(t)) el = e;
@@ -618,7 +632,11 @@ def locate(state, target, index):
                 state["page"].evaluate(REVEAL, r["label"])
                 state["page"].wait_for_timeout(300)
                 state["last"] = extract(state)
-                return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
+                try:
+                    return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
+                except ValueError:
+                    raise ValueError(f"{target!r} ({r['label']}) is inside a pane and could not be scrolled into view; "
+                                     f"try scroll DY {r['id']}")
         except ValueError:
             state["last"] = extract(state)  # the page may have changed since the last snapshot
             try:
@@ -802,6 +820,8 @@ def handle(state, req):
         elif not page.evaluate(FOCUSED):
             raise ValueError("nothing editable is focused — pass --into TARGET to click a field first")
         page.keyboard.type(req["text"], delay=25)
+        if req.get("enter"):
+            page.keyboard.press("Enter")
         settle(page)
         return act_result(state, note)
     if op == "hover":
@@ -961,6 +981,7 @@ def build_parser():
     sp = sub.add_parser("type", help="type into the focused element; returns the diff")
     sp.add_argument("text", help="text to type")
     sp.add_argument("--into", help="element (id or label) to click first")
+    sp.add_argument("--enter", action="store_true", help="press Enter after typing (submit a search or form)")
     sp = sub.add_parser("select", help="choose a dropdown option by its visible text; returns the diff")
     sp.add_argument("target", help="select element (id or label)")
     sp.add_argument("option", help="option text to choose")
@@ -980,7 +1001,8 @@ def build_parser():
     sp = sub.add_parser("wait", help="wait for the page to change on its own; returns the diff")
     sp.add_argument("secs", nargs="?", type=float, default=2, help="seconds to wait (max 10, default 2; max 60 with --for)")
     sp.add_argument("--for", dest="for_", metavar="TEXT", help="return as soon as TEXT appears on the page; error if it doesn't")
-    sp = sub.add_parser("run", help="run several commands in one round trip, e.g. run 'click Migas Taco' 'click Flour' 'click Add to cart'; stops at the first error")
+    sp = sub.add_parser("run", help="run several commands in one round trip; each argument is a whole ui command line, "
+                        "quoted, with its own quotes inside: run 'click \"Migas Taco\" Flour' 'type --into \"Search\" tacos' 'press Enter'; stops at the first error")
     sp.add_argument("lines", nargs="*", metavar="COMMAND", help="a ui command line (quoted); read from stdin, one per line, if none given")
     sub.add_parser("ledger", help="per-action cost vs accessibility-tree and screenshot baselines")
     sp = sub.add_parser("eval", help=argparse.SUPPRESS)
@@ -1011,6 +1033,8 @@ def build_req(p, a):
         req.update(text=a.text, label=f"type {a.text[:20]}")
         if a.into:
             req["into"] = a.into
+        if a.enter:
+            req["enter"] = True
     elif a.cmd == "select":
         req.update(target=a.target, option=a.option, label=f"select {a.option[:20]}")
     elif a.cmd == "hover":
