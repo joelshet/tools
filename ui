@@ -462,6 +462,17 @@ def resolve(rows, target, index):
         if not hits:
             hits = [r for r in rows if t in r["label"].casefold()
                     or (len(r["label"]) == 40 and t.startswith(r["label"].casefold()))]  # label was truncated
+        if not hits and " " in t:
+            # every word of the target in order somewhere in the label: survives a shell-eaten "$3" in "$3.95"
+            def in_order(label):
+                pos = 0
+                for w in t.split():
+                    pos = label.find(w, pos)
+                    if pos < 0:
+                        return False
+                    pos += len(w)
+                return True
+            hits = [r for r in rows if in_order(r["label"].casefold())]
     if not hits:
         raise ValueError(f"no element matching {target!r} — run read for a fresh snapshot")
     if len(hits) > 1 and not index:
