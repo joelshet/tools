@@ -116,7 +116,11 @@ EXTRACT = MODAL_JS + r"""(() => {
       if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') { hidden = true; break; }
     }
     if (hidden) continue;
-    if (modal && !modal.contains(el)) continue;
+    if (modal && !modal.contains(el)) {  // outside the modal: keep only what is actually on top (portals, dropdowns)
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !(el === hit || el.contains(hit) || hit.contains(el))) continue;
+      if (modal.contains(hit)) continue;
+    }
     if (el.closest('[aria-hidden="true"], [inert]')) continue;  // hidden from assistive tech: not operable
     const tag = el.tagName.toLowerCase(), role = el.getAttribute('role');
     let kind = role || tag, state = '-';
@@ -747,6 +751,8 @@ def handle(state, req):
             try:
                 o = handle(state, st)
             except Exception as e:
+                if "were done" in str(e):
+                    raise ValueError(f"step {i} {st['label']}: {e}")
                 raise ValueError(f"step {i} {st['label']}: {e} — steps 1-{i - 1} were done; run read")
             if "error" in o:
                 raise ValueError(f"step {i} {st['label']}: {o['error']} — steps 1-{i - 1} were done; run read")
