@@ -6,10 +6,10 @@
 """Operate a website as a persistent session; every action returns the diff it caused.
 
 Fast path: `open --headed URL`, then `read --all` once to learn the labels, then
-send whole sequences per call: `click "Migas Taco" Flour "Verde (Mild)" "Add to
-cart"` or `run 'click "Migas Taco" Flour' 'wait 5 --for Added'`. Round trips are
-the cost; a click reaches any label on the page, so scrolling is for looking,
-never for reaching.
+send whole sequences per call: `click "Item name" "Option A" "Add to cart"` or
+`run 'click "Item name" "Option A"' 'wait 5 --for Added'`. Round trips are the
+cost; a click reaches any label on the page, so scrolling is for looking, never
+for reaching.
 
 A daemon holds one headless (or headed) browser per named session; commands talk
 to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
