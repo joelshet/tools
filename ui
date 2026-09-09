@@ -10,9 +10,15 @@ to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
 (id kind label cx cy w h state); ids are stable for the life of the session, so
 a remembered id stays valid until the element leaves the page. Actions answer
 with the change they caused, so "= N unchanged" alone means the action did
-nothing visible; state flips (checkbox, tab, select) report themselves. `text`
+nothing visible; state flips (checkbox, radio, tab, select) report themselves,
+and toasts (role=status/alert, aria-live) appear as `status` rows. `text`
 prints the page's readable text; snapshots list only interactive elements and
-headings. Only elements in the viewport are clickable; scroll to reveal more.
+headings. Labels are visible text (screen-reader-only spans dropped), or the
+aria-label when it says more. Off-viewport targets are scrolled into view
+before a click; targets under a sticky header are re-centered first. `scroll DY
+TARGET` scrolls the pane holding TARGET (drawers, virtual lists) instead of the
+page. `wait --for TEXT` returns as soon as TEXT shows up. `open` with a flag the
+live session lacks (--headed, --video, --profile) restarts that session.
 New tabs are followed automatically. One-time setup beyond deps:
 playwright install chromium.
 """
@@ -39,11 +45,33 @@ EXTRACT = r"""(() => {
   const sx = window.scrollX, sy = window.scrollY;
   const sel = 'a, button, input, select, textarea, summary, h1, h2, h3, img, [onclick], ' +
     '[contenteditable="true"], [role="button"], [role="link"], [role="menuitem"], [role="tab"], ' +
-    '[role="checkbox"], [role="switch"], [role="textbox"], [role="option"]';
+    '[role="checkbox"], [role="switch"], [role="textbox"], [role="option"], [role="radio"], ' +
+    '[role="menuitemradio"], [role="status"], [role="alert"], [aria-live]';
+  // visible text only: skips screen-reader-only spans (1px clips) that pollute labels
+  const vis = (n) => {
+    if (n.nodeType === 3) return n.textContent;
+    if (n.nodeType !== 1) return '';
+    const cs = getComputedStyle(n);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return '';
+    const b = n.getBoundingClientRect();
+    if ((b.width < 2 || b.height < 2) && n.textContent.trim()) return '';
+    let out = '';
+    for (const c of n.childNodes) out += vis(c) + ' ';
+    return out;
+  };
   for (const el of document.querySelectorAll(sel)) {
-    const r = el.getBoundingClientRect();
+    let r = el.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) continue;
     if (!el.getClientRects().length) continue;
+    // clip to scrolling ancestors: a row scrolled out of its pane is not clickable
+    let cl = {left: r.left, top: r.top, right: r.right, bottom: r.bottom};
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      if (getComputedStyle(p).overflowY === 'visible') continue;
+      const b = p.getBoundingClientRect();
+      cl = {left: Math.max(cl.left, b.left), top: Math.max(cl.top, b.top), right: Math.min(cl.right, b.right), bottom: Math.min(cl.bottom, b.bottom)};
+    }
+    if (cl.right - cl.left < 8 || cl.bottom - cl.top < 8) continue;
+    r = {left: cl.left, top: cl.top, width: cl.right - cl.left, height: cl.bottom - cl.top};
     const st = getComputedStyle(el);
     if (st.visibility === 'hidden' || st.display === 'none' || st.opacity === '0') continue;
     let hidden = false;
@@ -54,7 +82,14 @@ EXTRACT = r"""(() => {
     if (hidden) continue;
     const tag = el.tagName.toLowerCase(), role = el.getAttribute('role');
     let kind = role || tag, state = '-';
-    let text = (el.innerText || el.getAttribute('aria-label') || el.title || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    let text = vis(el).trim().replace(/\s+/g, ' ');
+    const al = (el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+    if (al.length > text.length) text = al;  // e.g. "See your cart, 2 items" over "See your cart"
+    text = (text || el.title || '').slice(0, 40);
+    if (role === 'status' || role === 'alert' || el.hasAttribute('aria-live')) {
+      if (!text || (role !== 'status' && role !== 'alert' && !/^(polite|assertive)$/.test(el.getAttribute('aria-live')))) continue;
+      kind = 'status';
+    }
     if (tag === 'a') kind = role || 'link';
     if (/^h[1-3]$/.test(tag)) kind = 'heading';
     if (el.isContentEditable) kind = 'textbox';
@@ -83,7 +118,7 @@ EXTRACT = r"""(() => {
       else state = (el.value || '').trim().replace(/\s+/g, ' ').slice(0, 25) || '-';
       if (el.type === 'checkbox' || el.type === 'radio') state = el.checked ? 'on' : 'off';
     }
-    if (role === 'checkbox' || role === 'switch' || role === 'tab' || role === 'option')
+    if (role === 'checkbox' || role === 'switch' || role === 'tab' || role === 'option' || role === 'radio' || role === 'menuitemradio')
       state = (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true') ? 'on' : 'off';
     const cx = Math.round(r.left + sx + r.width / 2), cy = Math.round(r.top + sy + r.height / 2);
     const key = cx + '|' + cy + '|' + text;  // nested same-label interactives collapse to one row
@@ -112,7 +147,12 @@ SELECT = r"""([x, y, opt]) => {
   return '';
 }"""
 
-SCROLL = r"""(dy) => {
+SCROLL = r"""([dy, x, y]) => {
+  const scrollable = (el) => el.scrollHeight > el.clientHeight + 20 && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY);
+  if (x != null) {  // scroll the pane that contains the target element
+    for (let el = document.elementFromPoint(x, y); el && el !== document.body; el = el.parentElement)
+      if (scrollable(el)) { const t0 = el.scrollTop; el.scrollBy(0, dy); if (el.scrollTop !== t0) return 'pane'; }
+  }
   const y0 = window.scrollY;
   window.scrollBy(0, dy);
   if (window.scrollY !== y0) return 'window';
@@ -125,6 +165,17 @@ SCROLL = r"""(dy) => {
   }
   if (best) { const t0 = best.scrollTop; best.scrollBy(0, dy); if (best.scrollTop !== t0) return 'pane'; }
   return '';
+}"""
+
+OBSCURED = r"""([x, y, w, h]) => {
+  // true when the point is covered by something outside the target's box (sticky header, overlay)
+  const hit = document.elementFromPoint(x, y);
+  if (!hit) return false;
+  for (let el = hit; el; el = el.parentElement) {
+    const r = el.getBoundingClientRect();
+    if (Math.abs(r.width - w) <= 2 && Math.abs(r.height - h) <= 2 && Math.abs(r.left + r.width / 2 - x) <= 2) return false;
+  }
+  return true;
 }"""
 
 HTML = r"""([x, y, whole]) => {
@@ -408,7 +459,14 @@ def locate(state, target, index):
     try:
         return resolve(state["last"], target, index), None
     except ValueError:
-        r = resolve(state["all"], target, index)
+        try:
+            r = resolve(state["all"], target, index)
+        except ValueError:
+            state["last"] = extract(state)  # the page may have changed since the last snapshot
+            try:
+                return resolve(state["last"], target, index), None
+            except ValueError:
+                r = resolve(state["all"], target, index)
         state["page"].evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
         state["page"].wait_for_timeout(300)
         state["last"] = extract(state)
@@ -437,6 +495,13 @@ def click_at(state, r):
     if r["kind"] == "select":
         raise ValueError(f"use select {r['id']} OPTION to choose from a dropdown")
     x, y = r["cx"], r["cy"] - page.evaluate("window.scrollY")
+    if page.evaluate(OBSCURED, [x, y, r["w"], r["h"]]):
+        # covered by a sticky header or footer: bring it to the middle of the viewport and retry
+        page.evaluate(f"window.scrollTo(0, {max(0, r['cy'] - (state.get('vh') or state['h']) // 2)})")
+        page.wait_for_timeout(300)
+        state["last"] = extract(state)
+        r = next((n for n in state["last"] if n["id"] == r["id"]), r)
+        x, y = r["cx"], r["cy"] - page.evaluate("window.scrollY")
     if r["kind"] in PICKER:
         page.evaluate(f"document.elementFromPoint({x},{y})?.focus()")
     else:
@@ -526,11 +591,32 @@ def handle(state, req):
         return {k: v for k, v in
                 {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
     if op == "wait":
-        page.wait_for_timeout(min(float(req.get("secs") or 2), 10) * 1000)
+        secs = float(req.get("secs") or 2)
+        if req.get("for"):
+            needle = req["for"].casefold()
+            deadline = time.time() + min(secs, 60)
+            while True:
+                page.wait_for_timeout(250)
+                txt = page.evaluate("document.body.innerText")
+                if needle in txt.casefold():
+                    return act_result(state, f"found {req['for']!r}")
+                if time.time() > deadline:
+                    raise ValueError(f"{req['for']!r} did not appear within {min(secs, 60):g}s")
+        page.wait_for_timeout(min(secs, 10) * 1000)
         return act_result(state)
     if op == "scroll":
         # scrollBy, not mouse.wheel: wheel events are ignored under touch emulation
-        moved = page.evaluate(SCROLL, int(req["dy"]))
+        dy = req["dy"]
+        vh = state.get("vh") or state["h"]
+        if dy in ("down", "page"):
+            dy = int(vh * 0.8)
+        elif dy == "up":
+            dy = -int(vh * 0.8)
+        args = [int(dy), None, None]
+        if req.get("target"):
+            r, _ = locate(state, req["target"], None)
+            args[1:] = [r["cx"], r["cy"] - page.evaluate("window.scrollY")]
+        moved = page.evaluate(SCROLL, args)
         page.wait_for_timeout(500)
         out = act_result(state, "scrolled inner pane" if moved == "pane" else None)
         if not moved:
@@ -563,14 +649,27 @@ def alive(sock):
     try:
         call(sock, {"op": "ping"})
         return True
-    except (ConnectionRefusedError, FileNotFoundError, OSError):
-        return False
+    except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError):
+        return False  # ValueError: empty reply from a daemon that is shutting down
 
 
 def ensure_session(name, sock, url, flags):
+    flagfile = STATE / f"{name}.flags"
     if alive(sock):
-        return call(sock, {"op": "open", "url": url, "label": "open"})
+        have = flagfile.read_text().split() if flagfile.exists() else []
+        missing = [f for f in flags if f not in have]
+        if not missing:
+            return call(sock, {"op": "open", "url": url, "label": "open"})
+        # a live session can't gain --headed/--video/--profile; restart it with the union
+        print(f"restarting session {name!r} with {' '.join(missing)}", file=sys.stderr)
+        call(sock, {"op": "stop"})
+        for _ in range(20):
+            if not alive(sock):
+                break
+            time.sleep(0.25)
+        flags = have + missing
     STATE.mkdir(parents=True, exist_ok=True)
+    flagfile.write_text(" ".join(flags))
     log = open(STATE / f"session-{name}.log", "w")
     subprocess.Popen([sys.executable, str(pathlib.Path(__file__).resolve()), "-s", name, "daemon", url, *flags],
                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -630,12 +729,14 @@ def main():
     sp = sub.add_parser("goto", help="navigate the session; returns the diff")
     sp.add_argument("url", help="destination URL")
     sub.add_parser("back", help="go back in history; returns the diff")
-    sp = sub.add_parser("scroll", help="scroll vertically; returns the diff")
-    sp.add_argument("dy", type=int, help="pixels down (negative scrolls up)")
+    sp = sub.add_parser("scroll", help="scroll the page, or the pane holding TARGET; returns the diff")
+    sp.add_argument("dy", help="pixels down (negative scrolls up), or down/up for most of a screen")
+    sp.add_argument("target", nargs="?", help="element id or label inside the pane to scroll (lists, drawers, modals)")
     sp = sub.add_parser("resize", help="switch viewport; desktop reveals sidebars mobile layouts hide")
     sp.add_argument("preset", choices=["desktop", "mobile"], help="1280x900 or 375x812")
     sp = sub.add_parser("wait", help="wait for the page to change on its own; returns the diff")
-    sp.add_argument("secs", nargs="?", type=float, default=2, help="seconds to wait (max 10, default 2)")
+    sp.add_argument("secs", nargs="?", type=float, default=2, help="seconds to wait (max 10, default 2; max 60 with --for)")
+    sp.add_argument("--for", dest="for_", metavar="TEXT", help="return as soon as TEXT appears on the page; error if it doesn't")
     sub.add_parser("ledger", help="per-action cost vs accessibility-tree and screenshot baselines")
     sp = sub.add_parser("eval", help=argparse.SUPPRESS)
     sp.add_argument("js")
@@ -691,10 +792,16 @@ def main():
         req.update(preset=a.preset, label=f"resize {a.preset}")
     elif a.cmd == "wait":
         req.update(secs=a.secs, label=f"wait {a.secs}")
+        if a.for_:
+            req["for"] = a.for_
     elif a.cmd == "eval":
         req["js"] = a.js
     elif a.cmd == "scroll":
+        if not re.fullmatch(r"-?\d+|up|down|page", a.dy):
+            p.error("scroll dy must be an integer or up/down")
         req.update(dy=a.dy, label=f"scroll {a.dy}")
+        if a.target:
+            req["target"] = a.target
     resp = call(sock, req)
     if a.cmd == "ledger":
         for r in resp["rows"]:
