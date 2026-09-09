@@ -388,7 +388,7 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
         page.wait_for_timeout(1500)
 
         state = {"page": page, "all": [], "n": 0, "sy": 0, "sh": 0, "url": page.url, "dialogs": dialogs,
-                 "w": W, "h": H}
+                 "w": W, "h": H, "headed": headed}
         state["last"] = extract(state)
         print("ready", flush=True)
         while True:
@@ -460,7 +460,8 @@ def resolve(rows, target, index):
         t = target.casefold()
         hits = [r for r in rows if r["label"].casefold() == t]
         if not hits:
-            hits = [r for r in rows if t in r["label"].casefold()]
+            hits = [r for r in rows if t in r["label"].casefold()
+                    or (len(r["label"]) == 40 and t.startswith(r["label"].casefold()))]  # label was truncated
     if not hits:
         raise ValueError(f"no element matching {target!r} — run read for a fresh snapshot")
     if len(hits) > 1 and not index:
@@ -511,12 +512,22 @@ def locate(state, target, index):
         return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
 
 
+BOT_CHECK = r"""() => /Performing security verification|Verify you are human|Checking your browser|Just a moment/i.test(document.body.innerText.slice(0, 2000))"""
+
+
+def bot_check(state):
+    if state.get("headed") or not state["page"].evaluate(BOT_CHECK):
+        return None
+    return "bot check: headless browsers rarely pass it — stop and reopen with: ui open --headed URL"
+
+
 def act_result(state, note=None):
     switched = current_page(state)
     new = extract(state)
     out = {"diff": diff(state["last"], new)}
     state["last"] = new
-    notes = ([note] if note else []) + (["switched to new tab"] if switched else []) \
+    bot = bot_check(state)
+    notes = ([note] if note else []) + ([bot] if bot else []) + (["switched to new tab"] if switched else []) \
         + [f"dialog {d} (accepted)" for d in state["dialogs"]]
     state["dialogs"].clear()
     if notes:
@@ -557,7 +568,7 @@ def handle(state, req):
     if op == "read":
         state["last"] = extract(state)
         return {k: v for k, v in
-                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
+                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state), "note": bot_check(state)}.items() if v}
     if op == "text":
         txt = page.evaluate(TEXT)
         for fr, _ in frames(page):
@@ -579,14 +590,17 @@ def handle(state, req):
         state["last"] = extract(state)
         state["url"] = page.url
         return {k: v for k, v in
-                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state)}.items() if v}
+                {"tsv": ser(state["last"]), "url": page.url, "pos": pos(state), "note": bot_check(state)}.items() if v}
     if op == "click":
         r, note = locate(state, req["target"], req.get("index"))
         click_at(state, r)
         settle(page)
         out = act_result(state, note)
         if "\n" not in out["diff"] and "url" not in out and "note" not in out:
-            out["diff"] += "\n(no visible change)"
+            page.wait_for_timeout(900)  # panels that animate open or closed land after settle()
+            out = act_result(state, note)
+            if "\n" not in out["diff"] and "url" not in out and "note" not in out:
+                out["diff"] += "\n(no visible change)"
         return out
     if op == "select":
         r, note = locate(state, req["target"], req.get("index"))
@@ -742,12 +756,14 @@ def emit(resp):
 def main():
     p = argparse.ArgumentParser(prog="ui", description=__doc__.split("\n")[0])
     p.add_argument("-s", "--session", default="default", help="named session, for driving several sites in parallel (default: default)")
+    for flag in ("--headed", "--video", "--profile"):  # accepted before or after `open`
+        p.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("open", help="start a session at URL (or navigate the live one); prints the snapshot")
     sp.add_argument("url", help="page to open")
-    sp.add_argument("--headed", action="store_true", help="show the browser window")
-    sp.add_argument("--video", action="store_true", help="record a webm into ~/.tools/ui/video/")
-    sp.add_argument("--profile", action="store_true", help="persistent profile for this session name: log in once (headed), stay logged in")
+    sp.add_argument("--headed", action="store_true", default=argparse.SUPPRESS, help="show the browser window (also passes bot checks that block headless)")
+    sp.add_argument("--video", action="store_true", default=argparse.SUPPRESS, help="record a webm into ~/.tools/ui/video/")
+    sp.add_argument("--profile", action="store_true", default=argparse.SUPPRESS, help="persistent profile for this session name: log in once (headed), stay logged in")
     sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
     sp = sub.add_parser("text", help="readable page text (main content), capped per call")
     sp.add_argument("offset", nargs="?", type=int, default=0, help="character offset to continue from")
