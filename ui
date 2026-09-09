@@ -256,6 +256,10 @@ REVEAL = r"""(t) => {
   let el = null;
   for (const e of document.querySelectorAll(sel)) {
     let txt = vis(e).trim().replace(/\s+/g, ' ');
+    if (/^(input|textarea|select)$/i.test(e.tagName)) {
+      const lab = e.closest('label') || (e.id && document.querySelector('label[for="' + e.id + '"]'));
+      txt = ((lab && vis(lab)) || e.getAttribute('aria-label') || e.placeholder || e.name || '').trim().replace(/\s+/g, ' ');
+    }
     const al = (e.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
     if (al.length > txt.length) txt = al;
     txt = txt.toLowerCase();
@@ -492,6 +496,9 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
                 out = handle(state, req)
             except Exception as e:
                 out = {"error": f"{type(e).__name__}: {e}"}
+                if os.environ.get("UI_DEBUG"):
+                    import traceback
+                    out["error"] += "\n" + "".join(traceback.format_tb(e.__traceback__)[-3:])
                 gone = "browser closed" in str(e) or type(e).__name__ == "TargetClosedError"
             out["ms"] = int((time.time() - t0) * 1000)
             if req["op"] not in ("ping", "stop", "ledger") and "error" not in out:
@@ -637,7 +644,9 @@ def locate(state, target, index):
                 except ValueError:
                     raise ValueError(f"{target!r} ({r['label']}) is inside a pane and could not be scrolled into view; "
                                      f"try scroll DY {r['id']}")
-        except ValueError:
+        except ValueError as e:
+            if "inside a pane" in str(e):
+                raise
             state["last"] = extract(state)  # the page may have changed since the last snapshot
             try:
                 return resolve(state["last"], target, index), None
