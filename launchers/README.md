@@ -42,7 +42,7 @@ Two menu bar icons that are one-click launchers. Everything they show comes from
    ]
    ```
 
-The routines expect Zed at `/Applications/Zed.app`, and the current ones point at `~/hq`, `~/hq_video`, and `~/repos/recording-rig`. A routine whose target folder is missing fails with an alert; that's the signal to clone or copy that folder.
+The routines expect Zed at `/Applications/Zed.app`, and the current ones point at `~/hq`, `~/repos/hq_video`, and `~/repos/recording-rig`. A routine whose target folder is missing fails with an alert; that's the signal to clone or copy that folder.
 
 ## The Go pattern
 

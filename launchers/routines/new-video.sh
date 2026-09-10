@@ -1,10 +1,10 @@
 #!/bin/sh
-# new-video — move the newest video in ~/Downloads to ~/hq_video/_inbox,
-# then open Zed at ~/hq_video with README.md focused; its top line names
+# new-video — move the newest video in ~/Downloads to ~/repos/hq_video/_inbox,
+# then open Zed at ~/repos/hq_video with README.md focused; its top line names
 # the next step (ctrl-shift-space runs the claude task in Zed's terminal).
 set -eu
 
-INBOX="$HOME/hq_video/_inbox"
+INBOX="$HOME/repos/hq_video/_inbox"
 
 newest=$(find "$HOME/Downloads" -maxdepth 1 -type f \
     \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.mkv' -o -iname '*.webm' \) \
@@ -17,4 +17,4 @@ fi
 
 mv "$newest" "$INBOX/"
 
-"/Applications/Zed.app/Contents/MacOS/cli" "$HOME/hq_video" "$HOME/hq_video/README.md"
+"/Applications/Zed.app/Contents/MacOS/cli" "$HOME/repos/hq_video" "$HOME/repos/hq_video/README.md"
