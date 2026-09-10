@@ -8,9 +8,6 @@ export PATH="$PATH:/Users/joel/.lmstudio/bin"
 
 . "$HOME/.local/bin/env"
 
-# Added by Antigravity
-export PATH="/Users/joel/.antigravity/antigravity/bin:$PATH"
-export PATH="/Users/joel/repos/claude-code-playground/wui/bin:$PATH"
 
 # Tools
 export PATH="$HOME/tools:$PATH"
