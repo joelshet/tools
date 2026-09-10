@@ -5,13 +5,20 @@
 # ///
 """Operate a website as a persistent session; every action returns the diff it caused.
 
-Fast path: `open --headed URL`, then `read --all` once to learn the labels, then
-send whole sequences per call: `click "Item name" "Option A" "Add to cart"` or
-`run 'click "Item name" "Option A"' 'wait 5 --for Added'`. Round trips are the
-cost. A label matches by substring (`click "Add to cart"` hits "Add to cart
-$7.90"), a click reaches any label on the page, and every action already waits
-for the page to settle and for late targets, so no sleeps, no scrolling to
-reach things, no re-reading to confirm what the diff reported.
+Fast path: `open --headed URL` at the site's front page, then `read --all` once
+to learn the labels, then send whole sequences per call:
+`click "Item name" "Option A" "Add to cart"` or
+`run 'type --into Search "heritage flakes" --enter' 'wait 5 --for results' 'text'`.
+Drive the site the way a person does: its search box, menus, store pickers,
+filters. Do not compose search or filter URLs with query parameters; they skip
+the site's own flow (store, location, consent) and give wrong or empty pages.
+Round trips are the cost, so put the whole sequence in one call; `run` may end
+with `text` or `read` to extract in the same trip. One session drives every
+site in turn (`goto` switches); `-s NAME` is only for a second agent working at
+the same time. A label matches by substring (`click "Add to cart"` hits "Add to
+cart $7.90"), a click reaches any label on the page, and every action already
+waits for the page to settle and for late targets, so no sleeps, no scrolling
+to reach things, no re-reading to confirm what the diff reported.
 
 A daemon holds one headless (or headed) browser per named session; commands talk
 to it over a Unix socket in ~/.tools/ui/. Snapshots are viewport-scoped TSV rows
@@ -29,9 +36,9 @@ only spans dropped), or the aria-label when it says more. `scroll DY TARGET`
 scrolls the pane holding TARGET instead of the page. `wait --for TEXT` returns
 as soon as TEXT shows up. `open` with a flag the live session lacks (--headed,
 --video, --profile) restarts that session; headless browsers fail bot checks,
-so use --headed for sites that show one. A session is shared by name: parallel
-agents each take `-s NAME`. One-time setup beyond deps: playwright install
-chromium.
+so use --headed for sites that show one; a bot check in a headed window needs
+a person to solve it. A session is shared by name: two agents working at once
+each take `-s NAME`. One-time setup beyond deps: playwright install chromium.
 """
 import argparse
 import collections
@@ -106,8 +113,15 @@ EXTRACT = MODAL_JS + r"""(() => {
     if (!el.getClientRects().length) continue;
     // clip to scrolling ancestors: a row scrolled out of its pane is not clickable
     let cl = {left: r.left, top: r.top, right: r.right, bottom: r.bottom};
+    // a fixed element escapes every ancestor's overflow (until a transformed one); an absolute one escapes
+    // the static ancestors up to its containing block. Modals portaled into a 0-high wrapper rely on this.
+    let esc = getComputedStyle(el).position;
     for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
-      if (getComputedStyle(p).overflowY === 'visible') continue;
+      const ps = getComputedStyle(p);
+      if (esc === 'fixed' && ps.transform === 'none' && ps.filter === 'none' && ps.perspective === 'none') continue;
+      if (esc === 'absolute' && ps.position === 'static') continue;
+      esc = ps.position;
+      if (ps.overflowY === 'visible') continue;
       const b = p.getBoundingClientRect();
       cl = {left: Math.max(cl.left, b.left), top: Math.max(cl.top, b.top), right: Math.min(cl.right, b.right), bottom: Math.min(cl.bottom, b.bottom)};
     }
@@ -705,12 +719,14 @@ def locate(state, target, index):
         return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
 
 
-BOT_CHECK = r"""() => /Performing security verification|Verify you are human|Checking your browser|Just a moment/i.test(document.body.innerText.slice(0, 2000))"""
+BOT_CHECK = r"""() => /Performing security verification|Verify you are human|Checking your browser|Just a moment|Robot or human|Are you a human|Select all images with|Press & Hold|Access Denied/i.test(document.body.innerText.slice(0, 4000))"""
 
 
 def bot_check(state):
-    if state.get("headed") or not state["page"].evaluate(BOT_CHECK):
+    if not state["page"].evaluate(BOT_CHECK):
         return None
+    if state.get("headed"):
+        return "bot check on screen: it needs a person; ask them to solve it in the window, then continue"
     return "bot check: headless browsers rarely pass it — stop and reopen with: ui open --headed URL"
 
 
@@ -1010,7 +1026,7 @@ def emit(resp):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="ui", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-s", "--session", default="default", help="named session, for driving several sites in parallel (default: default)")
+    p.add_argument("-s", "--session", default="default", help="named session; one session drives any number of sites in turn, take a name only when two agents run at once (default: default)")
     for flag in ("--headed", "--video", "--profile"):  # accepted before or after `open`
         p.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
