@@ -14,8 +14,10 @@ filters. Do not compose search or filter URLs with query parameters; they skip
 the site's own flow (store, location, consent) and give wrong or empty pages.
 Round trips are the cost, so put the whole sequence in one call; `run` may end
 with `text` or `read` to extract in the same trip. One session drives every
-site in turn (`goto` switches); `-s NAME` is only for a second agent working at
-the same time. A label matches by substring (`click "Add to cart"` hits "Add to
+site in turn (`goto` switches); a second session is refused while one is live
+unless `-s NAME --parallel open URL`, which is only for a second agent. A "bot
+check on screen" note means a person must solve it in the window: stop, ask,
+then continue on that site. A label matches by substring (`click "Add to cart"` hits "Add to
 cart $7.90"), a click reaches any label on the page, and every action already
 waits for the page to settle and for late targets, so no sleeps, no scrolling
 to reach things, no re-reading to confirm what the diff reported.
@@ -501,18 +503,17 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
         if video:
             (STATE / "video").mkdir(parents=True, exist_ok=True)
             ctx_opts.update(record_video_dir=str(STATE / "video"), record_video_size={"width": W, "height": H})
-        # the installed Chrome with a persistent profile and no automation flag: navigator.webdriver stays
-        # false, cookies and consent survive restarts, and the bundled Chromium's fingerprint is not seen
+        # the installed Chrome with a persistent profile and no automation flag: cookies and consent survive
+        # restarts, and the bundled Chromium's fingerprint is not seen
         profile_dir.mkdir(parents=True, exist_ok=True)
-        seed_profile(profile_dir)
+        if os.environ.get("UI_SEED", "1") != "0":  # UI_SEED=0 / UI_CHANNEL=chromium: launch toggles for tests
+            seed_profile(profile_dir)
         # no mock keychain: the seeded cookies are encrypted with Chrome's real keychain key
-        launch = dict(headless=not headed, **ctx_opts,
+        launch = dict(headless=not headed, chromium_sandbox=True, **ctx_opts,  # no --no-sandbox infobar
                       ignore_default_args=["--enable-automation", "--use-mock-keychain", "--password-store=basic"])
-        if CHROME_APP.exists():
+        if CHROME_APP.exists() and os.environ.get("UI_CHANNEL", "chrome") == "chrome":
             launch["channel"] = "chrome"
         ctx = pl.chromium.launch_persistent_context(str(profile_dir), **launch)
-        # Playwright still flags navigator.webdriver over CDP; sites read it first
-        ctx.add_init_script("Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => false})")
         if headed or video:
             ctx.add_init_script(RIPPLE)
         dialogs = []
@@ -557,8 +558,11 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
                                "sent": len(sent), "tree": tree_bytes(state["page"])})
             if req["op"] == "ledger":
                 out["rows"] = ledger
-            f.write(json.dumps(out).encode() + b"\n")
-            f.flush()
+            try:
+                f.write(json.dumps(out).encode() + b"\n")
+                f.flush()
+            except OSError:
+                pass  # the client stopped waiting (its ping timed out during launch); the daemon lives on
             conn.close()
             if req["op"] == "stop" or gone:
                 break
@@ -743,14 +747,14 @@ def locate(state, target, index):
         return resolve(state["last"], r["id"], None), f"scrolled to {r['id']}"
 
 
-BOT_CHECK = r"""() => /Performing security verification|Verify you are human|Checking your browser|Just a moment|Robot or human|Are you a human|Select all images with|Press & Hold|Access Denied/i.test(document.body.innerText.slice(0, 4000))"""
+BOT_CHECK = r"""() => /Performing security verification|Verify you are human|Checking your browser|Just a moment|Robot or human|Are you a human|Select all images with|Press & Hold|Access Denied/i.test(document.body.innerText)"""
 
 
 def bot_check(state):
     if not state["page"].evaluate(BOT_CHECK):
         return None
     if state.get("headed"):
-        return "bot check on screen: it needs a person; ask them to solve it in the window, then continue"
+        return "bot check on screen: stop and ask the person to solve it in the window, then continue on this site"
     return "bot check: headless browsers rarely pass it — stop and reopen with: ui open --headed URL"
 
 
@@ -908,6 +912,8 @@ def handle(state, req):
             r, note = locate(state, req["into"], req.get("index"))
             click_at(state, r)
             page.wait_for_timeout(150)
+            if page.evaluate("() => { const a = document.activeElement; return !!(a && (a.value || (a.isContentEditable && a.innerText))); }"):
+                page.keyboard.press("ControlOrMeta+a")  # a person replaces the old search, not appends to it
         elif not page.evaluate(FOCUSED):
             raise ValueError("nothing editable is focused — pass --into TARGET to click a field first")
         page.keyboard.type(req["text"], delay=25)
@@ -952,7 +958,8 @@ def handle(state, req):
                 if needle in txt.casefold():
                     return act_result(state, f"found {req['for']!r}")
                 if time.time() > deadline:
-                    raise ValueError(f"{req['for']!r} did not appear within {min(secs, 60):g}s")
+                    bot = bot_check(state)
+                    raise ValueError(f"{req['for']!r} did not appear within {min(secs, 60):g}s" + (f"; {bot}" if bot else ""))
         page.wait_for_timeout(min(secs, 10) * 1000)
         return act_result(state)
     if op == "scroll":
@@ -980,8 +987,9 @@ def handle(state, req):
 
 # ---------- client ----------
 
-def call(sock, req):
+def call(sock, req, timeout=None):
     c = socket.socket(socket.AF_UNIX)
+    c.settimeout(timeout)
     c.connect(sock)
     f = c.makefile("rwb")
     f.write(json.dumps(req).encode() + b"\n")
@@ -998,14 +1006,36 @@ def alive(sock):
     if not os.path.exists(sock):
         return False
     try:
-        call(sock, {"op": "ping"})
+        call(sock, {"op": "ping"}, timeout=3)
         return True
+    except socket.timeout:
+        return False  # still launching the browser, or stuck on a dead one
     except (ConnectionRefusedError, FileNotFoundError, OSError, ValueError):
         return False  # ValueError: empty reply from a daemon that is shutting down
 
 
-def ensure_session(name, sock, url, flags):
+def kill_daemon(sock):
+    name = pathlib.Path(sock).stem
+    subprocess.run(["pkill", "-f", f"ui -s {name} daemon"], check=False)
+    try:
+        os.unlink(sock)
+    except FileNotFoundError:
+        pass
+
+
+def others_alive(name):
+    return [p.stem for p in STATE.glob("*.sock") if p.stem != name and alive(str(p))]
+
+
+def ensure_session(name, sock, url, flags, parallel=False):
     flagfile = STATE / f"{name}.flags"
+    if not alive(sock) and not parallel:
+        live = others_alive(name)
+        if live:
+            print(f"session {live[0]!r} is already live: one browser drives every site in turn (ui -s {live[0]} goto URL). "
+                  f"A second browser is only for a second agent working at the same time: ui -s {name} --parallel open URL",
+                  file=sys.stderr)
+            sys.exit(1)
     if alive(sock):
         have = flagfile.read_text().split() if flagfile.exists() else []
         missing = [f for f in flags if f not in have]
@@ -1051,7 +1081,7 @@ def emit(resp):
 def build_parser():
     p = argparse.ArgumentParser(prog="ui", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-s", "--session", default="default", help="named session; one session drives any number of sites in turn, take a name only when two agents run at once (default: default)")
-    for flag in ("--headed", "--video", "--profile"):  # accepted before or after `open`
+    for flag in ("--headed", "--video", "--profile", "--parallel"):  # accepted before or after `open`
         p.add_argument(flag, action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("open", help="start a session at URL (or navigate the live one); prints the snapshot")
@@ -1172,7 +1202,7 @@ def main():
         return
     if a.cmd == "open":
         flags = [f for f, on in [("--headed", a.headed), ("--video", a.video)] if on]
-        emit(ensure_session(a.session, sock, a.url, flags))
+        emit(ensure_session(a.session, sock, a.url, flags, parallel=a.parallel))
         return
     if not alive(sock):
         print(f"no live session {a.session!r} — start one with: ui open URL", file=sys.stderr)
@@ -1190,12 +1220,18 @@ def main():
         req = {"op": "run", "steps": steps, "label": f"run {len(steps)} steps"}
     else:
         req = build_req(p, a)
-    resp = call(sock, req)
+    try:
+        resp = call(sock, req, timeout=8 if a.cmd == "stop" else None)
+    except socket.timeout:  # the daemon is stuck on a dead browser: end it ourselves
+        kill_daemon(sock)
+        resp = {"ok": "stop"}
     if a.cmd == "stop":
         for _ in range(40):
             if not alive(sock):
                 break
             time.sleep(0.25)
+        else:
+            kill_daemon(sock)
     if a.cmd == "ledger":
         for r in resp["rows"]:
             print(f"{r['op']:<26}{r['ms']:>6}ms{r['sent']:>8}B sent   (tree {r['tree']}B, screenshot ~{SCREENSHOT_TOKENS}tok)")
