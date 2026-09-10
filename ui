@@ -34,8 +34,10 @@ snapshot: rows are its contents until it closes (Escape or its Close button),
 and `text` and `scroll` work inside it. Labels are visible text (screen-reader-
 only spans dropped), or the aria-label when it says more. `scroll DY TARGET`
 scrolls the pane holding TARGET instead of the page. `wait --for TEXT` returns
-as soon as TEXT shows up. `open` with a flag the live session lacks (--headed,
---video, --profile) restarts that session; headless browsers fail bot checks,
+as soon as TEXT shows up. Each session runs the installed Chrome with its own
+profile in ~/.tools/ui/profile-NAME, seeded once from your Chrome's cookies, so
+logins and consent survive restarts. `open` with a flag the live session lacks
+(--headed, --video) restarts that session; headless browsers fail bot checks,
 so use --headed for sites that show one; a bot check in a headed window needs
 a person to solve it. A session is shared by name: two agents working at once
 each take `-s NAME`. One-time setup beyond deps: playwright install chromium.
@@ -52,7 +54,10 @@ import sys
 import time
 
 STATE = pathlib.Path.home() / ".tools" / "ui"
-W, H = 375, 812
+W, H = 1280, 900  # desktop; `resize mobile` switches to MW, MH
+MW, MH = 375, 812
+CHROME_PROFILE = pathlib.Path.home() / "Library/Application Support/Google/Chrome/Default"
+CHROME_APP = pathlib.Path("/Applications/Google Chrome.app")
 SCREENSHOT_TOKENS = 1624  # 750x1624 @2x via the ~(w*h)/750 vision formula
 TOL = 3  # px of coordinate jitter that still counts as unchanged
 PICKER = {"time", "date", "datetime-local", "month", "week"}  # native picker overlay eats all input
@@ -466,6 +471,21 @@ def diff(old, new):
 
 # ---------- daemon ----------
 
+def seed_profile(profile_dir):
+    """First run of a session profile: copy the user's own Chrome cookies so sites see a known visitor."""
+    marker = profile_dir / "seeded-from-chrome"
+    src = CHROME_PROFILE / "Cookies"
+    if marker.exists() or not src.exists() or not CHROME_APP.exists():
+        return
+    import shutil
+    dst = profile_dir / "Default" / "Cookies"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        shutil.copy2(dst, dst.with_suffix(".bak"))
+    shutil.copy2(src, dst)
+    marker.write_text(time.strftime("%Y-%m-%d %H:%M"))
+
+
 def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
     from playwright.sync_api import sync_playwright
 
@@ -477,16 +497,22 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
     ino = os.stat(sock).st_ino
     ledger = []
     with sync_playwright() as pl:
-        ctx_opts = {"viewport": {"width": W, "height": H}, "is_mobile": True}  # honor meta viewport
+        ctx_opts = {"viewport": {"width": W, "height": H}}
         if video:
             (STATE / "video").mkdir(parents=True, exist_ok=True)
             ctx_opts.update(record_video_dir=str(STATE / "video"), record_video_size={"width": W, "height": H})
-        if profile_dir:
-            # logged-in sessions: cookies and storage persist in the profile
-            ctx = pl.chromium.launch_persistent_context(str(profile_dir), headless=not headed, **ctx_opts)
-        else:
-            browser = pl.chromium.launch(headless=not headed)
-            ctx = browser.new_context(**ctx_opts)
+        # the installed Chrome with a persistent profile and no automation flag: navigator.webdriver stays
+        # false, cookies and consent survive restarts, and the bundled Chromium's fingerprint is not seen
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        seed_profile(profile_dir)
+        # no mock keychain: the seeded cookies are encrypted with Chrome's real keychain key
+        launch = dict(headless=not headed, **ctx_opts,
+                      ignore_default_args=["--enable-automation", "--use-mock-keychain", "--password-store=basic"])
+        if CHROME_APP.exists():
+            launch["channel"] = "chrome"
+        ctx = pl.chromium.launch_persistent_context(str(profile_dir), **launch)
+        # Playwright still flags navigator.webdriver over CDP; sites read it first
+        ctx.add_init_script("Object.defineProperty(Navigator.prototype, 'webdriver', {get: () => false})")
         if headed or video:
             ctx.add_init_script(RIPPLE)
         dialogs = []
@@ -540,8 +566,6 @@ def run_daemon(url, sock, headed=False, video=False, profile_dir=None):
         ctx.close()
         if vid:
             print(f"video: {vid.path()}", flush=True)
-        if not profile_dir:
-            browser.close()
     try:
         if os.stat(sock).st_ino == ino:
             os.unlink(sock)
@@ -911,7 +935,7 @@ def handle(state, req):
     if op == "eval":  # internal: debugging escape hatch
         return {"text": json.dumps(page.evaluate(req["js"]))[:2000]}
     if op == "resize":
-        state["w"], state["h"] = (1280, 900) if req["preset"] == "desktop" else (W, H)
+        state["w"], state["h"] = (W, H) if req["preset"] == "desktop" else (MW, MH)
         page.set_viewport_size({"width": state["w"], "height": state["h"]})
         settle(page)
         state["last"] = extract(state)
@@ -987,7 +1011,7 @@ def ensure_session(name, sock, url, flags):
         missing = [f for f in flags if f not in have]
         if not missing:
             return call(sock, {"op": "open", "url": url, "label": "open"})
-        # a live session can't gain --headed/--video/--profile; restart it with the union
+        # a live session can't gain --headed/--video; restart it with the union
         print(f"restarting session {name!r} with {' '.join(missing)}", file=sys.stderr)
         call(sock, {"op": "stop"})
         for _ in range(40):
@@ -1034,7 +1058,7 @@ def build_parser():
     sp.add_argument("url", help="page to open")
     sp.add_argument("--headed", action="store_true", default=argparse.SUPPRESS, help="show the browser window (also passes bot checks that block headless)")
     sp.add_argument("--video", action="store_true", default=argparse.SUPPRESS, help="record a webm into ~/.tools/ui/video/")
-    sp.add_argument("--profile", action="store_true", default=argparse.SUPPRESS, help="persistent profile for this session name: log in once (headed), stay logged in")
+    sp.add_argument("--profile", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)  # always on now
     sp = sub.add_parser("read", help="viewport TSV snapshot; resets the diff baseline")
     sp.add_argument("--all", action="store_true", help="every element on the page, not just the viewport: survey once, then click by label")
     sp = sub.add_parser("text", help="readable page text (main content), capped per call")
@@ -1144,11 +1168,10 @@ def main():
     sock = str(STATE / f"{a.session}.sock")
     if a.cmd == "daemon":
         STATE.mkdir(parents=True, exist_ok=True)
-        pdir = STATE / f"profile-{a.session}" if a.profile else None
-        run_daemon(a.url, sock, headed=a.headed, video=a.video, profile_dir=pdir)
+        run_daemon(a.url, sock, headed=a.headed, video=a.video, profile_dir=STATE / f"profile-{a.session}")
         return
     if a.cmd == "open":
-        flags = [f for f, on in [("--headed", a.headed), ("--video", a.video), ("--profile", a.profile)] if on]
+        flags = [f for f, on in [("--headed", a.headed), ("--video", a.video)] if on]
         emit(ensure_session(a.session, sock, a.url, flags))
         return
     if not alive(sock):
