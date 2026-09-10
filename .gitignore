@@ -6,3 +6,10 @@ vgrep/
 # machine-local symlinks, recreate per machine
 zed
 pi-curator
+
+# built by launchers/build.sh
+launchers/TabGroups.app/
+
+# tab groups are personal; only the sample is tracked
+launchers/tabs/*.txt
+!launchers/tabs/example.txt

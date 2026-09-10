@@ -247,6 +247,7 @@ run <tool> <args>  log the invocation and execute (shell function)
 
 ```
 ~/tools/           tools on $PATH (this directory)
+  launchers/       menu bar launchers: tab groups, routines, TabGroups.app source (see launchers/README.md)
 ~/.tools/          config (not on PATH, not in your content)
   history.tsv      run log: timestamp, tool, command, cwd
   cache/           parsed --help cache (auto-invalidated by file mtime)

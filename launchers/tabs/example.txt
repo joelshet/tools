@@ -1,0 +1,4 @@
+# Example group: one URL per line, # for comments. The file name is the menu item.
+# Groups are not tracked in git; copy your own .txt files into this folder.
+https://mail.google.com/
+https://calendar.google.com/
