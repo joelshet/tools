@@ -4,8 +4,8 @@ __pycache__/
 vgrep/
 
 # machine-local symlinks, recreate per machine
-zed
-pi-curator
+/zed
+/pi-curator
 
 # built by launchers/build.sh
 launchers/TabGroups.app/

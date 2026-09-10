@@ -1,0 +1,40 @@
+export PATH=/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/opt/homebrew/bin:/opt/homebrew/bin
+export PATH="${HOME}/.cargo/bin:${PATH}"
+
+# Added by LM Studio CLI (lms)
+export PATH="$PATH:/Users/joel/.lmstudio/bin"
+# End of LM Studio CLI section
+
+
+. "$HOME/.local/bin/env"
+
+# Added by Antigravity
+export PATH="/Users/joel/.antigravity/antigravity/bin:$PATH"
+export PATH="/Users/joel/repos/claude-code-playground/wui/bin:$PATH"
+
+# Tools
+export PATH="$HOME/tools:$PATH"
+run() {
+    if [ $# -eq 0 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+        printf '\n  \033[1mrun\033[0m <tool> [args...]   log & execute any command\n\n'
+        printf '  \033[2magain          show history  │  again <tool>   re-run last\033[0m\n'
+        printf '  \033[2mguide <tool>   prompted run  │  tools          list tools\033[0m\n\n'
+        return
+    fi
+    printf '%s\t%s\t%s\t%s\n' \
+        "$(date +%Y-%m-%dT%H:%M)" \
+        "$(basename "$1")" \
+        "$*" \
+        "$PWD" >> "$HOME/.tools/history.tsv"
+    "$@"
+}
+
+# nvm
+export NVM_DIR="$HOME/.nvm"
+[ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"
+[ -s "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm" ] && \. "/opt/homebrew/opt/nvm/etc/bash_completion.d/nvm"
+
+# zoxide: smarter cd
+eval "$(zoxide init zsh)"
+
+export PATH="$HOME/tools/vgrep:$PATH"
