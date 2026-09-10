@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# runawake — disable macOS sleep, run each line of a file as a command,
+# then re-enable sleep and exit. Survives lid-close (uses pmset disablesleep).
+#
+# Usage:   runawake [-t hours] commands.txt
+#   -t hours   overall timeout, decimals ok (default: 2)
+#
+# Commands file is unix-style: one command per line; blank lines and
+# lines starting with # are ignored. A failing command doesn't stop the run.
+# Audio is muted for the run and restored to its previous state on exit.
+# Sleep is ALWAYS re-enabled on exit — normal finish, Ctrl+C, or timeout.
+#
+# Exit codes: 0 all ok · 1 some commands failed · 124 timed out · 2 usage
+
+set -u
+
+usage() { echo "Usage: $(basename "$0") [-t HOURS] COMMANDS_FILE" >&2; exit 2; }
+
+show_help() {
+  cat <<'HELP'
+Usage: runawake [-t HOURS] COMMANDS_FILE
+
+Keep the Mac awake (lid closed, audio muted) while running each line of a file as a command, then restore sleep and audio.
+
+positional arguments:
+  COMMANDS_FILE         one command per line; blank lines and # comments skipped
+
+options:
+  -h, --help            show this help and exit
+  -t HOURS              overall timeout in hours, decimals ok (default: 2)
+
+Exit codes: 0 all ok, 1 some commands failed, 124 timed out, 130 interrupted, 2 bad usage.
+Sleep and audio are always restored on exit. Manual recovery: sudo pmset -a disablesleep 0
+HELP
+  exit 0
+}
+[[ ${1:-} == --help ]] && show_help
+
+timeout_hours=2
+while getopts ":ht:" opt; do
+  case $opt in
+    h) show_help ;;
+    t) timeout_hours=$OPTARG ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+cmdfile=${1:-}
+[[ -n $cmdfile && -r $cmdfile ]] || usage
+[[ $timeout_hours =~ ^[0-9]*\.?[0-9]+$ ]] || usage
+timeout_secs=$(awk "BEGIN { print int($timeout_hours * 3600) }")
+(( timeout_secs > 0 )) || usage
+
+# Prime sudo now; keep its timestamp fresh so cleanup never has to prompt.
+sudo -v || exit 1
+( while sudo -n -v 2>/dev/null; do sleep 60; done ) &
+keepalive_pid=$!
+
+# Remember whether audio was already muted, then mute for the duration.
+orig_muted=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null || echo unknown)
+osascript -e 'set volume with output muted' 2>/dev/null
+
+child_pid=""
+watchdog_pid=""
+
+cleanup() {
+  trap - EXIT INT TERM
+  [[ -n $child_pid ]] && kill "$child_pid" 2>/dev/null
+  [[ -n $watchdog_pid ]] && kill "$watchdog_pid" 2>/dev/null
+  kill "$keepalive_pid" 2>/dev/null
+  if [[ $orig_muted == false ]]; then
+    osascript -e 'set volume without output muted' 2>/dev/null && echo "Audio unmuted."
+  fi
+  if sudo -n pmset -a disablesleep 0 2>/dev/null; then
+    echo "Sleep re-enabled."
+  else
+    echo "WARNING: could not re-enable sleep. Run: sudo pmset -a disablesleep 0" >&2
+  fi
+}
+trap cleanup EXIT
+trap 'echo; echo "Interrupted."; exit 130' INT
+trap 'echo "Overall timeout (${timeout_hours}h) reached — stopping."; exit 124' TERM
+
+sudo pmset -a disablesleep 1
+echo "Sleep disabled (lid-close safe), audio muted, timeout ${timeout_hours}h. Running: $cmdfile"
+
+( sleep "$timeout_secs" && kill -TERM $$ 2>/dev/null ) &
+watchdog_pid=$!
+
+ran=0 failed=0
+while IFS= read -r line || [[ -n $line ]]; do
+  [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*# ]] && continue
+  ran=$((ran + 1))
+  echo "▶ $line"
+  bash -c "$line" </dev/null &
+  child_pid=$!
+  wait "$child_pid"
+  status=$?
+  child_pid=""
+  if [[ $status -ne 0 ]]; then
+    failed=$((failed + 1))
+    echo "  ✗ exit $status"
+  fi
+done < "$cmdfile"
+
+echo "Done: $ran command(s), $failed failed."
+exit $(( failed > 0 ? 1 : 0 ))
